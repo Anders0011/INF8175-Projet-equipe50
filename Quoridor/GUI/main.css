@@ -1,0 +1,494 @@
+/* Orientation message for mobile devices */
+.orientation-message {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(187, 229, 249, 0.95);
+    z-index: 2000;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+}
+
+.orientation-message p {
+    font-size: 18px;
+    color: #333;
+    padding: 20px;
+    background-color: white;
+    border-radius: 10px;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+    margin: 20px;
+}
+
+/* Show orientation message on tablets and smartphones in portrait mode */
+@media screen and (max-width: 1024px) and (orientation: portrait) {
+    .orientation-message {
+        display: flex;
+    }
+}
+
+* {
+    font-family: Arial, Helvetica, sans-serif;
+}
+#canvasContainer {
+    display: flex; /*grid*/
+    justify-content: center; /* Centre le contenu horizontalement */
+    align-items: center; /* NEW */
+    margin: 20px 0;/* gap: 10px; *//*Espacement entre les éléments de grille */
+    flex-wrap: wrap; /* Permet le retour à la ligne si nécessaire */
+    max-width: 100vw; /* Limite la largeur à la largeur de l'écran */
+    overflow-x: auto; /* Permet le défilement horizontal si nécessaire */
+}
+
+#playerInfoContainer {
+    display: contents; /* On PC, behave as if this container doesn't exist */
+}
+
+/* On desktop, maintain the original side-by-side layout */
+@media (min-width: 1025px) {
+    #canvasContainer {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 10px;
+    }
+    
+    #playerInfoContainer {
+        display: contents; /* Make container invisible, children behave as direct children of #canvasContainer */
+    }
+    
+    #player1Info {
+        order: 1;
+    }
+    
+    #board {
+        order: 2;
+    }
+    
+    #player2Info {
+        order: 3;
+    }
+}
+.disabled{
+    pointer-events: none;
+    cursor: not-allowed;
+    opacity: 0.65;
+    filter: alpha(opacity=65);
+    -webkit-box-shadow: none;
+    box-shadow: none;
+}
+
+button,input[type=text] {
+    background-color: #f0f0f0;
+    border: none;
+    color: #333;
+    padding: 8px 16px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 14px;
+    cursor: pointer;
+    border-radius: 4px;
+    margin: 15px;
+}
+
+#error{
+    position: absolute;
+    top: 50px;
+    right: 50px;
+    background-color: #ff8282;
+    border: 1px solid #fc3838;
+    color:white;
+    padding: 25px 50px;
+    border-radius: 5px;
+    font-size: large;
+    font-family: Arial, Helvetica, sans-serif;
+    opacity: 0;
+    transition: opacity 0.5s ease-in-out;
+}
+#buttons{
+    position: absolute;
+    top: 0;
+    /* left: 0; */
+    vertical-align: middle;
+}
+button:hover {
+    background-color: #ddd;
+}
+body{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background-color: rgb(187, 229, 249);
+    flex-shrink: 0;
+}
+html,body{
+    height: 100vh;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+#pop_up_container{
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100vh;
+    display: none;
+    justify-content: center;
+    align-items: center;
+    background-color: rgba(0,0,0,0.5);
+    z-index: 1000;
+}
+#pop_up{
+    width:50%;
+    height: 70%;
+    border-radius: 10px;
+    background-color: lightgray;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-evenly;
+    align-items: center;
+}
+#close_pop_up{
+    position: absolute;
+    top: 20px;
+    right: 40px;
+    font-size: 40px;
+    cursor: pointer;
+}
+#pop_up h2{
+    font-size:80px 
+}
+#pop_up p{
+    font-size: 40px;
+    text-align: center;
+    width: 80%;
+}
+
+#status{
+    background-color: lightgray;
+    border-radius: 5px;
+    padding: 5px 10px;
+}
+.winner_indicator {
+  width: 30px;
+  height: 30px;
+  background-color: currentColor;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px black; /* simulate border */
+  display: inline-block;
+  position: relative;
+  top: 5px;
+}
+
+.winner_indicator.W{
+    background-color: white;
+}
+.winner_indicator.B{
+    background-color: black;
+}
+#connect{
+    transition: all 0.5s ease-in-out;
+    border : 2px solid #f0f0f0;
+}
+@keyframes blink {
+    from {
+       border: 2px solid #f0f0f0;
+   }
+    to {
+       border: 2px solid red;
+   }
+}
+.connection_error{
+    animation: blink 1s infinite;
+    animation-direction: alternate;
+}
+
+.player-info {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 15px;
+    margin: 0 10px;
+    background-color: rgba(255, 255, 255, 0.8);
+    border-radius: 10px;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+    min-width: 120px;
+    min-height: 80px;
+    transition: all 0.3s ease;
+    flex-shrink: 0; /* Empêche la réduction de taille */
+    box-sizing: border-box; /* Inclut la bordure dans la taille */
+    border: 3px solid transparent; /* Bordure transparente par défaut */
+}
+
+.player-info.active {
+    border: 3px solid #4CAF50;
+    box-shadow: 0 4px 10px rgba(76, 175, 80, 0.3);
+    /* Suppression du transform scale qui causait le décalage */
+}
+
+.player-name {
+    font-size: 16px;
+    font-weight: bold;
+    margin-bottom: 8px;
+    text-align: center;
+    color: #333;
+}
+
+.player-piece {
+    width: 35px;
+    height: 35px;
+    background-color: #ccc;
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+    border-radius: 50%;
+    border: 2px solid #ddd;
+}
+
+.player-walls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin-top: 8px;
+    font-size: 14px;
+    font-weight: bold;
+    color: #333;
+}
+
+.player-wall-icon {
+    width: 24px;
+    height: 14px;
+    object-fit: contain;
+    display: block;
+}
+
+.player-walls-count {
+    min-width: 1ch;
+    text-align: left;
+}
+
+/* Media queries pour les écrans plus petits */
+@media (max-width: 1400px) {
+    .player-info {
+        padding: 10px;
+        margin: 0 5px;
+        min-width: 100px;
+        min-height: 70px;
+    }
+    
+    .player-name {
+        font-size: 14px;
+        margin-bottom: 5px;
+    }
+    
+    .player-piece {
+        width: 30px;
+        height: 30px;
+    }
+
+    .player-walls {
+        margin-top: 6px;
+        font-size: 12px;
+        gap: 5px;
+    }
+
+    .player-wall-icon {
+        width: 20px;
+        height: 12px;
+    }
+}
+
+/* Tablet and mobile layout - board above player panels */
+@media (max-width: 1024px) and (min-width: 601px) and (min-height: 601px) {
+    body {
+        min-height: 100vh;
+        padding: 10px;
+        box-sizing: border-box;
+    }
+    
+    #canvasContainer {
+        flex-direction: column;
+        align-items: center;
+        margin: 10px 0;
+        width: 100%;
+    }
+    
+    #board {
+        max-width: 95vw;
+        max-height: 50vh;
+        width: auto;
+        height: auto;
+        margin-bottom: 15px;
+        order: 1;
+    }
+    
+    #playerInfoContainer {
+        display: flex;
+        flex-direction: row;
+        gap: 20px;
+        margin-top: 10px;
+        order: 2;
+        justify-content: center;
+        width: 100%;
+    }
+    
+    .player-info {
+        margin: 0;
+        flex-direction: column;
+        min-width: 120px;
+        min-height: 50px;
+        padding: 8px 12px;
+    }
+    
+    .player-name {
+        margin-bottom: 0;
+        margin-right: 10px;
+        font-size: 14px;
+    }
+    
+    .player-piece {
+        width: 28px;
+        height: 28px;
+    }
+
+    .player-walls {
+        margin-top: 6px;
+        font-size: 12px;
+    }
+
+    .player-wall-icon {
+        width: 20px;
+        height: 12px;
+    }
+    
+    #buttons {
+        position: relative;
+        top: auto;
+        margin-bottom: 10px;
+        text-align: center;
+        width: 100%;
+        padding: 0 10px;
+        box-sizing: border-box;
+    }
+    
+    button, input[type=text] {
+        margin: 5px 3px;
+        padding: 6px 12px;
+        font-size: 12px;
+    }
+}
+
+/* Smartphone layout - players stacked vertically next to board */
+/* Use max device dimensions to detect phones regardless of orientation */
+@media (max-width: 600px), 
+       (max-height: 600px) and (max-width: 900px) {
+    body {
+        padding: 5px;
+        min-height: 100vh;
+        box-sizing: border-box;
+    }
+    
+    #canvasContainer {
+        flex-direction: row !important;
+        align-items: flex-start !important;
+        justify-content: center !important;
+        margin: 5px 0;
+        width: 100%;
+        gap: 0 !important; /* No space between board and players */
+    }
+    
+    #board {
+        max-width: 70vw;
+        max-height: 60vh;
+        width: auto;
+        height: auto;
+        order: 1;
+        flex-shrink: 0;
+        margin-bottom: 0 !important;
+    }
+    
+    #playerInfoContainer {
+        display: flex !important;
+        flex-direction: column !important;
+        gap: 8px !important;
+        order: 2;
+        justify-content: flex-start;
+        margin: 0 !important;
+        padding: 0;
+        width: auto;
+    }
+    
+    .player-info {
+        margin: 0 !important;
+        flex-direction: column !important;
+        min-width: 80px !important;
+        min-height: auto !important;
+        padding: 4px 6px !important;
+        text-align: center;
+        background-color: rgba(255, 255, 255, 0.9);
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+    }
+    
+    .player-name {
+        margin-bottom: 4px !important;
+        margin-right: 0 !important;
+        font-size: 11px !important;
+        font-weight: bold;
+    }
+    
+    .player-piece {
+        width: 22px !important;
+        height: 22px !important;
+        margin: 0 auto;
+    }
+
+    .player-walls {
+        margin-top: 4px;
+        gap: 4px;
+        font-size: 10px !important;
+    }
+
+    .player-wall-icon {
+        width: 16px;
+        height: 10px;
+    }
+    
+    #buttons {
+        position: relative;
+        top: auto;
+        margin-bottom: 8px;
+        text-align: center;
+        width: 100%;
+        padding: 0 5px;
+        box-sizing: border-box;
+    }
+    
+    button, input[type=text] {
+        margin: 2px 1px;
+        padding: 3px 6px;
+        font-size: 10px;
+    }
+    
+    input[type=range] {
+        width: 60px;
+    }
+}
+
+.player-piece.W {
+    background-image: url('./assets/W.png');
+}
+
+.player-piece.B {
+    background-image: url('./assets/B.png');
+}
