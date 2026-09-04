@@ -285,7 +285,7 @@ class GameStateQuoridor(GameState):
             bool: True if at least one wall blocks the movement.
         """
         
-        return any(wall in self.rep.walls for wall in self._candidate_blocking_walls(start, end))
+        return (any(wall in self.rep.walls for wall in self._candidate_blocking_walls(start, end))  or any(coord<0 for coord in end) or any(coord>=self.rep.dimension for coord in end))
 
 
     # ------------------------------------------------------------------
