@@ -1,0 +1,3 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_walls_left,black_walls_left
+0,my_player,v0_greedy,my_player,900,2,white,goal,75,648.12,5.98,40.01,0.37,0,0
+1,v0_greedy,my_player,my_player,900,2,black,goal,70,5.07,629.55,0.38,41.76,0,1
