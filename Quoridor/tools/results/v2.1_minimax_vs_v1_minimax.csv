@@ -1,0 +1,9 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_walls_left,black_walls_left
+0,v2.1_minimax,v1_minimax,v1_minimax,900.0,2,black,goal,66,688.18,672.26,40.83,40.58,0,1
+1,v1_minimax,v2.1_minimax,v2.1_minimax,900.0,2,black,timeout,40,931.64,672.88,251.97,192.17,1,4
+2,v2.1_minimax,v1_minimax,v1_minimax,900.0,2,black,timeout,16,1541.6,558.27,776.48,281.18,8,8
+0,v2.1_minimax,v1_minimax,v2.1_minimax,900.0,0,white,timeout,45,692.88,12206.39,363.17,11634.63,1,1
+1,v1_minimax,v2.1_minimax,v1_minimax,900.0,0,white,timeout,7,180.78,2441.95,52.96,2323.18,9,10
+2,v2.1_minimax,v1_minimax,v2.1_minimax,900.0,0,white,goal,63,618.59,637.72,40.27,40.22,0,0
+3,v1_minimax,v2.1_minimax,v2.1_minimax,900.0,0,black,goal,64,639.73,605.3,40.39,40.16,0,0
+4,v2.1_minimax,v1_minimax,v1_minimax,900.0,0,black,timeout,32,3100.58,420.22,2681.32,40.48,1,1

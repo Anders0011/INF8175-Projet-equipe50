@@ -1,0 +1,2 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_walls_left,black_walls_left
+0,my_player,v1_minimax,my_player,120.0,2,white,goal,61,94.49,90.3,6.33,6.54,0,0

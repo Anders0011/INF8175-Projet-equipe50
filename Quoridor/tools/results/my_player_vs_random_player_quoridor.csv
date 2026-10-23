@@ -1,0 +1,2 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_walls_left,black_walls_left
+0,my_player,random_player_quoridor,my_player,60.0,2,white,goal,17,14.05,2.32,1.99,0.45,10,3
