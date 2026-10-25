@@ -1,0 +1,7 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_max_move_cpu,black_max_move_cpu,white_walls_left,black_walls_left
+0,my_player,v3_timefix,v3_timefix,60.0,2,black,goal,100,54.46,55.2,3.28,3.31,3.27,3.27,0,0
+1,v3_timefix,my_player,v3_timefix,60.0,2,white,goal,79,55.35,51.85,3.32,3.28,3.31,3.28,0,0
+2,my_player,v3_timefix,my_player,60.0,2,white,goal,83,51.04,50.04,3.28,3.31,3.28,3.3,0,0
+3,v3_timefix,my_player,v3_timefix,60.0,2,white,goal,71,47.99,41.4,3.32,3.28,3.31,3.28,0,0
+4,my_player,v3_timefix,my_player,60.0,2,white,goal,75,54.36,53.23,3.47,3.33,3.45,3.31,0,0
+5,v3_timefix,my_player,my_player,60.0,2,black,goal,58,49.03,52.53,3.49,3.28,3.45,3.25,3,1

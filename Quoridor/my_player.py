@@ -1,10 +1,14 @@
+# INF8175 - Projet Quoridor - Automne 2026 - Equipe 50
+# Anders Antoine   - 2252046
+# Adam Lecavalier  - 2253227
+
 from __future__ import annotations
 
+import random
 import time
-from collections import deque
 from math import inf
 
-from actions_quoridor import Orientation
+from actions_quoridor import Orientation, Wall
 from game_state_quoridor import GameStateQuoridor
 from player_quoridor import PlayerQuoridor
 from seahorse.game.action import Action
@@ -26,19 +30,439 @@ NO_PATH_SCORE = 500_000.0
 
 SAFETY_MARGIN = 1.0        # seconds always left unspent, to absorb IPC/serialization latency
 MIN_BUDGET = 0.05
+MAX_MOVE_BUDGET = 30.0     # no single move may claim more than this, whatever the estimate says
+MAX_BUDGET_FRACTION = 0.2  # nor more than this share of the time left, so the tail can never run dry
+MIN_MOVES_LEFT = 12        # floor on the remaining-move estimate, for the same reason
 MAX_WALL_CANDIDATES = 24   # branching-factor cap for wall moves considered at any search node
 MAX_TT_ENTRIES = 200_000
 MAX_DEPTH = 30
+
+NORTH, SOUTH, WEST, EAST = 0, 1, 2, 3
+# Same order as GameStateQuoridor.DIRECTIONS, so move generation matches the engine's.
+_DELTAS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+_OPPOSITE_AXIS = ((WEST, EAST), (WEST, EAST), (NORTH, SOUTH), (NORTH, SOUTH))
+
+
+class _Geometry:
+    """
+    Board tables that depend only on the dimension, computed once and shared.
+
+    The search runs on plain ints and bitmasks instead of the engine's Wall
+    objects and frozensets: rebuilding those at every node is what limited
+    the search to depth 2-3.
+    """
+
+    _cache: dict[int, "_Geometry"] = {}
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+        size = dim * dim
+
+        self.neighbours = [[-1] * 4 for _ in range(size)]
+        for row in range(dim):
+            for col in range(dim):
+                cell = row * dim + col
+                for direction, (d_row, d_col) in enumerate(_DELTAS):
+                    n_row, n_col = row + d_row, col + d_col
+                    if 0 <= n_row < dim and 0 <= n_col < dim:
+                        self.neighbours[cell][direction] = n_row * dim + n_col
+
+        # Which (cell, direction) crossings each wall closes.
+        self.h_edges: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
+        self.v_edges: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
+        for row in range(dim):
+            for col in range(dim):
+                self.h_edges[(row, col)] = tuple(self._horizontal_edges(row, col))
+                self.v_edges[(row, col)] = tuple(self._vertical_edges(row, col))
+
+        # Inverse table: which walls could close a given (cell, direction).
+        # Mirrors GameStateQuoridor._candidate_blocking_walls, bounds included.
+        self.blockers: list[list[tuple[tuple[bool, int, int], ...]]] = [
+            [() for _ in range(4)] for _ in range(size)
+        ]
+        for row in range(dim):
+            for col in range(dim):
+                cell = row * dim + col
+                south, north, east, west = [], [], [], []
+                if col > 0:
+                    south.append((True, row + 1, col - 1))
+                    north.append((True, row, col - 1))
+                if col < dim - 1:
+                    south.append((True, row + 1, col))
+                    north.append((True, row, col))
+                if row > 0:
+                    east.append((False, row - 1, col + 1))
+                    west.append((False, row - 1, col))
+                if row < dim - 1:
+                    east.append((False, row, col + 1))
+                    west.append((False, row, col))
+                self.blockers[cell][SOUTH] = tuple(south)
+                self.blockers[cell][NORTH] = tuple(north)
+                self.blockers[cell][EAST] = tuple(east)
+                self.blockers[cell][WEST] = tuple(west)
+
+        self.row_of = [cell // dim for cell in range(size)]
+
+    def _horizontal_edges(self, row: int, col: int) -> list[tuple[int, int]]:
+        """A horizontal wall at (row, col) closes the two north-south crossings beneath it."""
+        dim = self.dim
+        edges = []
+        if 1 <= row < dim:
+            for c in (col, col + 1):
+                if 0 <= c < dim:
+                    edges.append(((row - 1) * dim + c, 1 << SOUTH))
+                    edges.append((row * dim + c, 1 << NORTH))
+        return edges
+
+    def _vertical_edges(self, row: int, col: int) -> list[tuple[int, int]]:
+        """A vertical wall at (row, col) closes the two east-west crossings beside it."""
+        dim = self.dim
+        edges = []
+        if 1 <= col < dim:
+            for r in (row, row + 1):
+                if 0 <= r < dim:
+                    edges.append((r * dim + col - 1, 1 << EAST))
+                    edges.append((r * dim + col, 1 << WEST))
+        return edges
+
+    @classmethod
+    def get(cls, dim: int) -> "_Geometry":
+        geometry = cls._cache.get(dim)
+        if geometry is None:
+            geometry = cls(dim)
+            cls._cache[dim] = geometry
+        return geometry
+
+
+class _Zobrist:
+    """Incremental hash keys, so a node's key costs a few XORs instead of hashing every wall."""
+
+    _cache: dict[int, "_Zobrist"] = {}
+
+    def __init__(self, dim: int) -> None:
+        rng = random.Random(0x5EED)
+        size = dim * dim
+        bits = 64
+        self.h_wall = [[rng.getrandbits(bits) for _ in range(dim)] for _ in range(dim)]
+        self.v_wall = [[rng.getrandbits(bits) for _ in range(dim)] for _ in range(dim)]
+        self.pawn = [[rng.getrandbits(bits) for _ in range(size)] for _ in range(2)]
+        self.walls_left = [[rng.getrandbits(bits) for _ in range(32)] for _ in range(2)]
+        self.side = rng.getrandbits(bits)
+
+    @classmethod
+    def get(cls, dim: int) -> "_Zobrist":
+        table = cls._cache.get(dim)
+        if table is None:
+            table = cls(dim)
+            cls._cache[dim] = table
+        return table
+
+
+class _Board:
+    """
+    Mutable board the search works on, with make/unmake instead of copying.
+
+    Players are indexed 0/1 internally; `player_ids` maps back to engine ids.
+    """
+
+    __slots__ = ("geo", "zobrist", "dim", "blocked", "h_walls", "v_walls",
+                 "pawns", "goals", "walls_left", "player_ids", "turn", "hash")
+
+    def __init__(self, state: GameStateQuoridor, my_id: int) -> None:
+        dim = state.rep.dimension
+        self.geo = _Geometry.get(dim)
+        self.zobrist = _Zobrist.get(dim)
+        self.dim = dim
+        self.blocked = [0] * (dim * dim)
+
+        opponent_id = next(p.id for p in state.players if p.id != my_id)
+        self.player_ids = (my_id, opponent_id)
+
+        players = {p.id: p for p in state.players}
+        self.pawns = []
+        self.goals = []
+        self.walls_left = []
+        for pid in self.player_ids:
+            row, col = state.rep.pawn_positions[pid]
+            self.pawns.append(row * dim + col)
+            self.goals.append(players[pid].get_goal_row())
+            self.walls_left.append(state.rep.remaining_walls.get(pid, 0))
+
+        self.h_walls: set[tuple[int, int]] = set()
+        self.v_walls: set[tuple[int, int]] = set()
+        for wall in state.rep.walls:
+            self._place_wall_bits(wall.orientation == Orientation.HORIZONTAL, wall.row, wall.col)
+
+        self.turn = 0 if state.active_player.id == my_id else 1
+        self.hash = self._full_hash()
+
+    # ------------------------------------------------------------------
+    # Hashing
+    # ------------------------------------------------------------------
+
+    def _full_hash(self) -> int:
+        z = self.zobrist
+        value = 0
+        for row, col in self.h_walls:
+            value ^= z.h_wall[row][col]
+        for row, col in self.v_walls:
+            value ^= z.v_wall[row][col]
+        for player in (0, 1):
+            value ^= z.pawn[player][self.pawns[player]]
+            value ^= z.walls_left[player][self.walls_left[player]]
+        if self.turn:
+            value ^= z.side
+        return value
+
+    # ------------------------------------------------------------------
+    # Wall bookkeeping
+    # ------------------------------------------------------------------
+
+    def _place_wall_bits(self, is_horizontal: bool, row: int, col: int) -> None:
+        edges = self.geo.h_edges if is_horizontal else self.geo.v_edges
+        blocked = self.blocked
+        for cell, bit in edges[(row, col)]:
+            blocked[cell] |= bit
+        (self.h_walls if is_horizontal else self.v_walls).add((row, col))
+
+    def _clear_wall_bits(self, is_horizontal: bool, row: int, col: int) -> None:
+        edges = self.geo.h_edges if is_horizontal else self.geo.v_edges
+        blocked = self.blocked
+        for cell, bit in edges[(row, col)]:
+            blocked[cell] &= ~bit
+        (self.h_walls if is_horizontal else self.v_walls).discard((row, col))
+
+    # ------------------------------------------------------------------
+    # Make / unmake
+    # ------------------------------------------------------------------
+
+    def make_move(self, cell: int) -> int:
+        player = self.turn
+        previous = self.pawns[player]
+        z = self.zobrist
+        self.pawns[player] = cell
+        self.hash ^= z.pawn[player][previous] ^ z.pawn[player][cell] ^ z.side
+        self.turn ^= 1
+        return previous
+
+    def unmake_move(self, previous: int) -> None:
+        self.turn ^= 1
+        player = self.turn
+        cell = self.pawns[player]
+        z = self.zobrist
+        self.pawns[player] = previous
+        self.hash ^= z.pawn[player][cell] ^ z.pawn[player][previous] ^ z.side
+
+    def make_wall(self, is_horizontal: bool, row: int, col: int) -> None:
+        player = self.turn
+        self._place_wall_bits(is_horizontal, row, col)
+        left = self.walls_left[player]
+        self.walls_left[player] = left - 1
+        z = self.zobrist
+        table = z.h_wall if is_horizontal else z.v_wall
+        self.hash ^= table[row][col] ^ z.walls_left[player][left] ^ z.walls_left[player][left - 1] ^ z.side
+        self.turn ^= 1
+
+    def unmake_wall(self, is_horizontal: bool, row: int, col: int) -> None:
+        self.turn ^= 1
+        player = self.turn
+        self._clear_wall_bits(is_horizontal, row, col)
+        left = self.walls_left[player]
+        self.walls_left[player] = left + 1
+        z = self.zobrist
+        table = z.h_wall if is_horizontal else z.v_wall
+        self.hash ^= table[row][col] ^ z.walls_left[player][left] ^ z.walls_left[player][left + 1] ^ z.side
+
+    # ------------------------------------------------------------------
+    # Pawn moves (mirrors GameStateQuoridor._try_direction, jumps included)
+    # ------------------------------------------------------------------
+
+    def pawn_destinations(self, player: int) -> list[int]:
+        destinations: list[int] = []
+        other = self.pawns[1 - player]
+        for direction in range(4):
+            self._try_direction(self.pawns[player], direction, other, destinations)
+        seen = set()
+        unique = []
+        for cell in destinations:
+            if cell not in seen:
+                seen.add(cell)
+                unique.append(cell)
+        return unique
+
+    def _try_direction(self, cell: int, direction: int, other: int, out: list[int]) -> None:
+        nxt = self.geo.neighbours[cell][direction]
+        if nxt < 0 or self.blocked[cell] & (1 << direction):
+            return
+        if nxt == other:
+            beyond = self.geo.neighbours[nxt][direction]
+            if beyond >= 0 and not self.blocked[nxt] & (1 << direction):
+                self._try_direction(nxt, direction, other, out)
+            else:
+                for side in _OPPOSITE_AXIS[direction]:
+                    self._try_direction(nxt, side, other, out)
+            return
+        out.append(nxt)
+
+    # ------------------------------------------------------------------
+    # Path finding (ignores pawns, like the engine's _shortest_path)
+    # ------------------------------------------------------------------
+
+    def distance(self, player: int) -> int | None:
+        """A* with the admissible 'rows remaining' heuristic, bucket queue."""
+        start = self.pawns[player]
+        goal_row = self.goals[player]
+        row_of = self.geo.row_of
+        if row_of[start] == goal_row:
+            return 0
+
+        neighbours = self.geo.neighbours
+        blocked = self.blocked
+        size = self.dim * self.dim
+
+        best = [-1] * size
+        best[start] = 0
+        # f = cost + rows-to-goal; a winding path can cost up to size-1, so the
+        # queue must reach size-1 + (dim-1), not just a couple of board widths.
+        buckets: list[list[int]] = [[] for _ in range(size + self.dim)]
+        buckets[abs(row_of[start] - goal_row)].append(start)
+
+        for f in range(len(buckets)):
+            bucket = buckets[f]
+            index = 0
+            while index < len(bucket):
+                cell = bucket[index]
+                index += 1
+                cost = best[cell]
+                if cost + abs(row_of[cell] - goal_row) != f:
+                    continue  # stale entry, a cheaper path to this cell was found
+                if row_of[cell] == goal_row:
+                    return cost
+                mask = blocked[cell]
+                row = neighbours[cell]
+                for direction in range(4):
+                    if mask & (1 << direction):
+                        continue
+                    nxt = row[direction]
+                    if nxt < 0:
+                        continue
+                    new_cost = cost + 1
+                    if best[nxt] == -1 or new_cost < best[nxt]:
+                        best[nxt] = new_cost
+                        buckets[new_cost + abs(row_of[nxt] - goal_row)].append(nxt)
+        return None
+
+    def has_path(self, player: int) -> bool:
+        """Reachability only, depth-first with early exit — cheaper than a full distance."""
+        start = self.pawns[player]
+        goal_row = self.goals[player]
+        row_of = self.geo.row_of
+        if row_of[start] == goal_row:
+            return True
+
+        neighbours = self.geo.neighbours
+        blocked = self.blocked
+        seen = bytearray(self.dim * self.dim)
+        seen[start] = 1
+        stack = [start]
+        while stack:
+            cell = stack.pop()
+            mask = blocked[cell]
+            row = neighbours[cell]
+            for direction in range(4):
+                if mask & (1 << direction):
+                    continue
+                nxt = row[direction]
+                if nxt < 0 or seen[nxt]:
+                    continue
+                if row_of[nxt] == goal_row:
+                    return True
+                seen[nxt] = 1
+                stack.append(nxt)
+        return False
+
+    def mobility(self, player: int) -> int:
+        mask = self.blocked[self.pawns[player]]
+        row = self.geo.neighbours[self.pawns[player]]
+        return sum(1 for d in range(4) if row[d] >= 0 and not mask & (1 << d))
+
+    # ------------------------------------------------------------------
+    # Wall legality (mirrors GameStateQuoridor._is_wall_legal exactly)
+    # ------------------------------------------------------------------
+
+    def wall_legal(self, is_horizontal: bool, row: int, col: int) -> bool:
+        dim = self.dim
+        if self.walls_left[self.turn] <= 0:
+            return False
+        if not (0 <= row < dim and 0 <= col < dim):
+            return False
+
+        if is_horizontal:
+            if not 0 <= col < dim - 1:
+                return False
+            h = self.h_walls
+            if (row, col) in h or (row, col + 1) in h or (row, col - 1) in h:
+                return False
+            if (row - 1, col + 1) in self.v_walls:
+                return False
+        else:
+            if not 0 <= row < dim - 1:
+                return False
+            v = self.v_walls
+            if (row, col) in v or (row - 1, col) in v or (row + 1, col) in v:
+                return False
+            if (row + 1, col - 1) in self.h_walls:
+                return False
+
+        self._place_wall_bits(is_horizontal, row, col)
+        ok = self.has_path(0) and self.has_path(1)
+        self._clear_wall_bits(is_horizontal, row, col)
+        return ok
+
+    def shortest_path_cells(self, player: int) -> list[int]:
+        """Cells on one shortest path, used to pick wall candidates."""
+        start = self.pawns[player]
+        goal_row = self.goals[player]
+        row_of = self.geo.row_of
+        neighbours = self.geo.neighbours
+        blocked = self.blocked
+
+        parent = {start: -1}
+        queue = [start]
+        index = 0
+        while index < len(queue):
+            cell = queue[index]
+            index += 1
+            if row_of[cell] == goal_row:
+                path = []
+                while cell != -1:
+                    path.append(cell)
+                    cell = parent[cell]
+                path.reverse()
+                return path
+            mask = blocked[cell]
+            row = neighbours[cell]
+            for direction in range(4):
+                if mask & (1 << direction):
+                    continue
+                nxt = row[direction]
+                if nxt >= 0 and nxt not in parent:
+                    parent[nxt] = cell
+                    queue.append(nxt)
+        return []
+
+
+# A search action is a tuple: ("move", cell) or ("wall", is_horizontal, row, col).
 
 
 class MyPlayer(PlayerQuoridor):
     """
     Quoridor agent driven by iterative-deepening alpha-beta minimax.
 
-    The whole-game time budget (15 minutes total, enforced by seahorse's
-    GameMaster) is split across moves in `_time_budget`, and the search is
-    aborted cleanly via `_TimeUp` as soon as that per-move budget runs out,
-    falling back to the best move found at the last fully completed depth.
+    The search runs on `_Board`, a mutable bitmask representation with
+    make/unmake and incremental Zobrist hashing, rather than on the engine's
+    immutable states: allocating engine objects at every node capped the
+    search at depth 2-3.
 
     Attributes:
         piece_type (str): piece type of the player
@@ -72,49 +496,55 @@ class MyPlayer(PlayerQuoridor):
         Returns:
             Action: The selected legal action.
         """
-        legal_actions = tuple(current_state.generate_possible_stateless_actions())
-        if not legal_actions:
-            raise RuntimeError("No legal action available.")
-        if len(legal_actions) == 1:
-            return legal_actions[0]
+        # The clock starts here, not after the setup below: everything this
+        # method does counts against the move's budget.
+        start = time.perf_counter()
 
-        me = current_state.active_player
-        opponent = self._opponent(current_state, me)
+        board = _Board(current_state, current_state.active_player.id)
+        deadline = start + self._time_budget(board, remaining_time)
 
-        # Guaranteed fallback: a fast depth-1 choice, in case the deeper search never completes.
-        best_action = self._best_shallow_action(current_state, legal_actions, me.id, opponent.id)
+        actions = self._candidate_actions(board)
+        if not actions:
+            return self._engine_fallback(current_state)
+        if len(actions) == 1:
+            return self._to_engine_action(actions[0], current_state)
 
-        deadline = time.perf_counter() + self._time_budget(current_state, me, opponent, remaining_time)
+        # Cheap guaranteed fallback. Depth 1 of the search below refines it
+        # almost immediately, so it only has to be legal and sane, not good.
+        best_action = self._fallback_action(board, actions)
 
         depth = 1
         try:
             while depth <= MAX_DEPTH:
-                action, _ = self._search_root(current_state, legal_actions, depth, me.id, opponent.id, deadline)
+                action, _ = self._search_root(board, actions, depth, deadline)
                 if action is not None:
                     best_action = action
                 depth += 1
         except _TimeUp:
             pass
 
-        return best_action
+        return self._to_engine_action(best_action, current_state)
 
-    def _time_budget(self, state: GameStateQuoridor, me: Player, opponent: Player, remaining_time: float) -> float:
+    def _time_budget(self, board: _Board, remaining_time: float) -> float:
         """
-        Splits the whole-game time budget across moves: fewer moves are
-        expected to remain as pawns get closer to their goal and walls run
-        out, so later moves get a bigger share automatically.
+        Share of the whole-game budget granted to this move.
+
+        Estimated from my own remaining turns (at best one row per turn, plus
+        the turns spent placing walls). Three caps keep a single move from
+        ever claiming an absurd slice: an absolute ceiling, a fraction of what
+        is left, and a floor under the remaining-move estimate. Without them
+        an endgame estimate of "4 moves left" granted 225s for one move.
         """
         if remaining_time <= SAFETY_MARGIN:
             return 0.0
 
-        my_distance = state._shortest_path(me) or 0
-        opponent_distance = state._shortest_path(opponent) or 0
-        walls_left = state.rep.remaining_walls.get(me.id, 0) + state.rep.remaining_walls.get(opponent.id, 0)
-        moves_left_estimate = max(4, my_distance + opponent_distance + walls_left // 2)
+        my_distance = board.distance(board.turn) or 0
+        my_walls = board.walls_left[board.turn]
+        moves_left_estimate = max(MIN_MOVES_LEFT, my_distance + my_walls)
 
         usable = remaining_time - SAFETY_MARGIN
-        budget = usable / moves_left_estimate
-        return max(MIN_BUDGET, min(budget, usable * 0.5))
+        budget = min(usable / moves_left_estimate, MAX_MOVE_BUDGET, usable * MAX_BUDGET_FRACTION)
+        return max(min(MIN_BUDGET, usable), budget)
 
     # ------------------------------------------------------------------
     # Search
@@ -122,32 +552,29 @@ class MyPlayer(PlayerQuoridor):
 
     def _search_root(
         self,
-        state: GameStateQuoridor,
-        legal_actions: tuple[Action, ...],
+        board: _Board,
+        actions: list[tuple],
         depth: int,
-        my_id: int,
-        opponent_id: int,
         deadline: float,
-    ) -> tuple[Action | None, float]:
+    ) -> tuple[tuple | None, float]:
         """
         One full iterative-deepening pass: explores every candidate action at
         the root and returns the best one found, or raises `_TimeUp` if the
         budget runs out before every root action has been explored (the
         partial result is then discarded by the caller).
         """
-        actions = self._candidate_actions(state, legal_actions=legal_actions)
-        tt_key = (hash(state.rep), state.active_player.id, depth)
+        tt_key = (board.hash, depth)
         cached = self._tt.get(tt_key)
-        tt_move_key = cached[2] if cached else None
-        actions = self._order_actions(state, actions, tt_move_key)
+        actions = self._order_actions(board, actions, cached[2] if cached else None)
 
         alpha, beta = -inf, inf
         best_action = None
         best_value = -inf
 
         for action in actions:
-            child = state.apply_action(action)
-            value = self._alphabeta(child, depth - 1, alpha, beta, False, my_id, opponent_id, deadline)
+            undo = self._make(board, action)
+            value = self._alphabeta(board, depth - 1, alpha, beta, False, deadline)
+            self._unmake(board, action, undo)
 
             if value > best_value:
                 best_value = value
@@ -157,19 +584,17 @@ class MyPlayer(PlayerQuoridor):
         # Root search always uses the full (-inf, inf) window, so a completed
         # pass never fails high/low: the value is always exact here.
         if best_action is not None:
-            self._store_tt(tt_key, best_value, "EXACT", self._action_key(best_action))
+            self._store_tt(tt_key, best_value, "EXACT", best_action)
 
         return best_action, best_value
 
     def _alphabeta(
         self,
-        state: GameStateQuoridor,
+        board: _Board,
         depth: int,
         alpha: float,
         beta: float,
         maximizing: bool,
-        my_id: int,
-        opponent_id: int,
         deadline: float,
     ) -> float:
         """
@@ -180,21 +605,21 @@ class MyPlayer(PlayerQuoridor):
         if time.perf_counter() >= deadline:
             raise _TimeUp()
 
-        if state.scores.get(my_id, 0.0) == 1.0:
+        row_of = board.geo.row_of
+        if row_of[board.pawns[0]] == board.goals[0]:
             return WIN_SCORE + depth
-        if state.scores.get(opponent_id, 0.0) == 1.0:
+        if row_of[board.pawns[1]] == board.goals[1]:
             return -WIN_SCORE - depth
         if depth == 0:
-            return self._evaluate(state, my_id, opponent_id)
+            return self._evaluate(board)
 
         alpha_orig, beta_orig = alpha, beta
-        tt_key = (hash(state.rep), state.active_player.id, depth)
+        tt_key = (board.hash, depth)
         cached = self._tt.get(tt_key)
-        tt_move_key = None
+        tt_move = None
 
         if cached is not None:
-            cached_value, cached_flag, cached_move_key = cached
-            tt_move_key = cached_move_key
+            cached_value, cached_flag, tt_move = cached
             if cached_flag == "EXACT":
                 return cached_value
             if cached_flag == "LOWERBOUND":
@@ -204,25 +629,25 @@ class MyPlayer(PlayerQuoridor):
             if alpha >= beta:
                 return cached_value
 
-        actions = self._candidate_actions(state)
-        actions = self._order_actions(state, actions, tt_move_key)
+        actions = self._order_actions(board, self._candidate_actions(board), tt_move)
 
         best_value = -inf if maximizing else inf
-        best_key = None
+        best_action = None
 
         for action in actions:
-            child = state.apply_action(action)
-            value = self._alphabeta(child, depth - 1, alpha, beta, not maximizing, my_id, opponent_id, deadline)
+            undo = self._make(board, action)
+            value = self._alphabeta(board, depth - 1, alpha, beta, not maximizing, deadline)
+            self._unmake(board, action, undo)
 
             if maximizing:
                 if value > best_value:
                     best_value = value
-                    best_key = self._action_key(action)
+                    best_action = action
                 alpha = max(alpha, value)
             else:
                 if value < best_value:
                     best_value = value
-                    best_key = self._action_key(action)
+                    best_action = action
                 beta = min(beta, value)
 
             if alpha >= beta:
@@ -239,95 +664,80 @@ class MyPlayer(PlayerQuoridor):
         else:
             flag = "EXACT"
 
-        self._store_tt(tt_key, best_value, flag, best_key)
+        self._store_tt(tt_key, best_value, flag, best_action)
         return best_value
 
-    def _store_tt(self, key: tuple, value: float, flag: str, action_key: tuple | None) -> None:
+    def _store_tt(self, key: tuple, value: float, flag: str, action: tuple | None) -> None:
         if len(self._tt) >= MAX_TT_ENTRIES:
             self._tt.clear()
-        self._tt[key] = (value, flag, action_key)
+        self._tt[key] = (value, flag, action)
+
+    @staticmethod
+    def _make(board: _Board, action: tuple):
+        if action[0] == "move":
+            return board.make_move(action[1])
+        board.make_wall(action[1], action[2], action[3])
+        return None
+
+    @staticmethod
+    def _unmake(board: _Board, action: tuple, undo) -> None:
+        if action[0] == "move":
+            board.unmake_move(undo)
+        else:
+            board.unmake_wall(action[1], action[2], action[3])
 
     # ------------------------------------------------------------------
-    # Action generation restricted to the moves worth searching
+    # Action generation
     # ------------------------------------------------------------------
 
-    def _candidate_actions(
-        self,
-        state: GameStateQuoridor,
-        legal_actions: tuple[Action, ...] | None = None,
-    ) -> list[Action]:
+    def _candidate_actions(self, board: _Board) -> list[tuple]:
         """
         Keeps every pawn move, and only the walls that touch the opponent's
         or our own current shortest path.
 
-        Checking legality of all ~128 wall placements (two BFS runs each, via
-        `_is_wall_legal`) at every node of the tree would collapse the
-        achievable search depth to 1-2. Restricting candidates to walls that
-        can actually affect a shortest path keeps the branching factor small
-        while still covering every action worth considering.
+        Testing all ~128 wall slots at every node would collapse the
+        achievable depth; walls that touch neither shortest path cannot
+        change either player's distance this ply anyway.
         """
-        moves = list(state._legal_moves())
+        player = board.turn
+        actions: list[tuple] = [("move", cell) for cell in board.pawn_destinations(player)]
+        if board.walls_left[player] <= 0:
+            return actions
 
-        active_id = state.active_player.id
-        if state.rep.remaining_walls.get(active_id, 0) <= 0:
-            return moves
-
-        me = state.active_player
-        opponent = self._opponent(state, me)
-        opponent_path = self._shortest_path_positions(state, opponent)
-        my_path = self._shortest_path_positions(state, me)
-
+        blockers = board.geo.blockers
+        neighbours = board.geo.neighbours
         seen = set()
-        wall_candidates = []
-
-        def collect(path):
-            if not path or len(path) < 2:
-                return
-            for start, end in zip(path, path[1:]):
-                for wall in state._candidate_blocking_walls(start, end):
-                    key = (wall.row, wall.col, wall.orientation)
-                    if key not in seen:
-                        seen.add(key)
-                        wall_candidates.append(wall)
-
-        collect(opponent_path)
-        collect(my_path)
-
         walls = []
-        if legal_actions is not None:
-            legal_lookup = {
-                (a.data["type"], a.data["destination"]): a
-                for a in legal_actions if a.data["type"] != "move"
-            }
-            for wall in wall_candidates:
-                action_type = "vertical" if wall.orientation == Orientation.VERTICAL else "horizontal"
-                action = legal_lookup.get((action_type, (wall.row, wall.col)))
-                if action is not None:
-                    walls.append(action)
-        else:
-            for wall in wall_candidates:
-                if state._is_wall_legal(wall):
-                    action_type = "vertical" if wall.orientation == Orientation.VERTICAL else "horizontal"
-                    walls.append(StatelessAction({"type": action_type, "destination": (wall.row, wall.col)}))
 
-        return moves + walls[:MAX_WALL_CANDIDATES]
+        for who in (1 - player, player):
+            path = board.shortest_path_cells(who)
+            for cell, nxt in zip(path, path[1:]):
+                direction = next(d for d in range(4) if neighbours[cell][d] == nxt)
+                for candidate in blockers[cell][direction]:
+                    if candidate in seen:
+                        continue
+                    seen.add(candidate)
+                    if board.wall_legal(candidate[0], candidate[1], candidate[2]):
+                        walls.append(("wall", candidate[0], candidate[1], candidate[2]))
 
-    def _order_actions(self, state: GameStateQuoridor, actions: list[Action], tt_move_key: tuple | None) -> list[Action]:
+        return actions + walls[:MAX_WALL_CANDIDATES]
+
+    def _order_actions(self, board: _Board, actions: list[tuple], tt_move: tuple | None) -> list[tuple]:
         """
         Cheap move ordering to improve alpha-beta cutoffs: the transposition
         table's best move first, then pawn moves by how much closer they get
         to the goal row, then walls in the order `_candidate_actions` found
         them (opponent-blocking walls before path-protecting ones).
         """
-        goal_row = state.active_player.get_goal_row()
-        current_row, _ = state.rep.pawn_positions[state.active_player.id]
+        row_of = board.geo.row_of
+        goal_row = board.goals[board.turn]
+        current_row = row_of[board.pawns[board.turn]]
 
-        def score(action: Action) -> float:
-            if tt_move_key is not None and self._action_key(action) == tt_move_key:
+        def score(action: tuple) -> float:
+            if tt_move is not None and action == tt_move:
                 return 1_000.0
-            if action.data["type"] == "move":
-                new_row, _ = action.data["destination"]
-                return 10.0 + (abs(current_row - goal_row) - abs(new_row - goal_row))
+            if action[0] == "move":
+                return 10.0 + (abs(current_row - goal_row) - abs(row_of[action[1]] - goal_row))
             return 0.0
 
         return sorted(actions, key=score, reverse=True)
@@ -336,103 +746,74 @@ class MyPlayer(PlayerQuoridor):
     # Evaluation
     # ------------------------------------------------------------------
 
-    def _evaluate(self, state: GameStateQuoridor, my_id: int, opponent_id: int) -> float:
-        """
-        Higher is better for my_id. Distances come from BFS on the board graph.
-        """
-        if state.scores.get(my_id, 0.0) == 1.0:
-            return WIN_SCORE
-        if state.scores.get(opponent_id, 0.0) == 1.0:
-            return -WIN_SCORE
-
-        me = self._player_by_id(state, my_id)
-        opponent = self._player_by_id(state, opponent_id)
-
-        my_distance = state._shortest_path(me)
-        opponent_distance = state._shortest_path(opponent)
+    def _evaluate(self, board: _Board) -> float:
+        """Higher is better for player 0, who is always the side we play."""
+        my_distance = board.distance(0)
+        opponent_distance = board.distance(1)
 
         if my_distance is None:
             return -NO_PATH_SCORE
         if opponent_distance is None:
             return NO_PATH_SCORE
 
-        my_walls = state.rep.remaining_walls.get(my_id, 0)
-        opponent_walls = state.rep.remaining_walls.get(opponent_id, 0)
-
         return (
             W_DISTANCE * (opponent_distance - my_distance)
-            + W_WALLS * (my_walls - opponent_walls)
-            + W_MOBILITY * (self._mobility(state, me) - self._mobility(state, opponent))
+            + W_WALLS * (board.walls_left[0] - board.walls_left[1])
+            + W_MOBILITY * (board.mobility(0) - board.mobility(1))
         )
 
-    def _best_shallow_action(
-        self,
-        state: GameStateQuoridor,
-        legal_actions: tuple[Action, ...],
-        my_id: int,
-        opponent_id: int,
-    ) -> Action:
+    def _fallback_action(self, board: _Board, actions: list[tuple]) -> tuple:
         """
-        Best action after a single ply of lookahead. Always cheap enough to
-        finish even when almost no time budget remains, so it acts as a safe
-        fallback if the deeper search gets interrupted immediately.
+        The pawn move that gets closest to the goal, or any legal action if
+        none advances. Only a handful of path computations, so it still
+        completes when the budget is nearly zero.
         """
-        best_action = legal_actions[0]
-        best_score = -inf
+        best_action = actions[0]
+        best_distance = inf
 
-        for action in legal_actions:
-            score = self._evaluate(state.apply_action(action), my_id, opponent_id)
-            if score > best_score:
-                best_score = score
+        for action in actions:
+            if action[0] != "move":
+                continue
+            undo = board.make_move(action[1])
+            distance = board.distance(0)
+            board.unmake_move(undo)
+            if distance is not None and distance < best_distance:
+                best_distance = distance
                 best_action = action
 
         return best_action
 
     # ------------------------------------------------------------------
-    # Shared helpers
+    # Conversion back to engine actions
     # ------------------------------------------------------------------
 
-    def _shortest_path_positions(self, state: GameStateQuoridor, player: Player) -> list[tuple[int, int]] | None:
+    def _to_engine_action(self, action: tuple, state: GameStateQuoridor) -> Action:
         """
-        BFS path reconstruction (ignoring the opponent pawn, like the engine's
-        own `_shortest_path`) used to pick meaningful wall candidates.
+        Build the engine action, and verify it against the engine's own rules.
+
+        The search runs on a reimplementation of the game rules, so a single
+        divergence would mean an illegal action and an instant loss. This
+        check costs one legality call per turn, against the ~270ms it would
+        take to enumerate every legal action.
         """
-        start = state.rep.pawn_positions[player.id]
-        goal_row = player.get_goal_row()
-        queue = deque([start])
-        visited = {start}
-        parent = {start: None}
-
-        while queue:
-            position = queue.popleft()
-            if position[0] == goal_row:
-                path = []
-                while position is not None:
-                    path.append(position)
-                    position = parent[position]
-                path.reverse()
-                return path
-
-            for neighbour in state._reachable_neighbours(position):
-                if neighbour not in visited:
-                    visited.add(neighbour)
-                    parent[neighbour] = position
-                    queue.append(neighbour)
-
-        return None
-
-    def _mobility(self, state: GameStateQuoridor, player: Player) -> int:
-        """
-        Count simple reachable neighbours around a pawn, ignoring jump rules.
-        """
-        return len(state._reachable_neighbours(state.rep.pawn_positions[player.id]))
-
-    def _opponent(self, state: GameStateQuoridor, player: Player) -> Player:
-        return next(other for other in state.players if other.id != player.id)
-
-    def _player_by_id(self, state: GameStateQuoridor, player_id: int) -> Player:
-        return next(player for player in state.players if player.id == player_id)
+        dimension = state.rep.dimension
+        if action[0] == "move":
+            destination = (action[1] // dimension, action[1] % dimension)
+            if any(a.data["destination"] == destination for a in state._legal_moves()):
+                return StatelessAction({"type": "move", "destination": destination})
+        else:
+            is_horizontal, row, col = action[1], action[2], action[3]
+            orientation = Orientation.HORIZONTAL if is_horizontal else Orientation.VERTICAL
+            if state._is_wall_legal(Wall(row, col, orientation)):
+                return StatelessAction({
+                    "type": "horizontal" if is_horizontal else "vertical",
+                    "destination": (row, col),
+                })
+        return self._engine_fallback(state)
 
     @staticmethod
-    def _action_key(action: Action) -> tuple:
-        return (action.data["type"], action.data["destination"])
+    def _engine_fallback(state: GameStateQuoridor) -> Action:
+        """Last resort: ask the engine itself, so we can never return an illegal action."""
+        for action in state.generate_possible_stateless_actions():
+            return action
+        raise RuntimeError("No legal action available.")
