@@ -1,0 +1,17 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_max_move_cpu,black_max_move_cpu,white_walls_left,black_walls_left
+0,v4i_walls15,my_player,v4i_walls15,40.0,2,white,goal,75,37.3,32.81,2.31,2.3,2.3,2.28,0,2
+1,my_player,v4i_walls15,v4i_walls15,40.0,2,black,goal,88,37.89,36.29,2.3,2.47,2.23,2.47,0,2
+2,v4i_walls15,my_player,my_player,40.0,2,black,goal,64,31.07,35.98,2.17,2.17,2.17,2.17,5,0
+3,my_player,v4i_walls15,my_player,40.0,2,white,goal,73,36.1,35.4,2.18,2.33,2.17,2.28,1,0
+4,v4i_walls15,my_player,my_player,40.0,2,black,goal,86,37.32,35.37,2.17,2.3,2.12,2.2,0,0
+5,my_player,v4i_walls15,my_player,40.0,2,white,goal,71,36.48,32.94,2.17,2.3,2.17,2.3,0,0
+6,v4i_walls15,my_player,v4i_walls15,40.0,2,white,goal,43,31.97,24.02,2.18,2.17,2.17,2.17,0,8
+7,my_player,v4i_walls15,my_player,40.0,2,white,goal,63,34.86,35.05,2.17,2.33,2.12,2.3,4,0
+8,v4i_walls15,my_player,v4i_walls15,40.0,2,white,goal,79,36.4,34.08,2.17,2.17,2.17,2.12,0,0
+9,my_player,v4i_walls15,my_player,40.0,2,white,goal,83,36.18,37.67,2.17,2.17,2.17,2.17,1,0
+10,v4i_walls15,my_player,v4i_walls15,40.0,2,white,goal,43,31.97,24.02,2.17,2.17,2.17,2.14,0,8
+11,my_player,v4i_walls15,my_player,40.0,2,white,goal,73,36.1,35.66,2.18,2.33,2.14,2.31,1,0
+12,v4i_walls15,my_player,my_player,40.0,2,black,goal,78,37.26,35.31,2.18,2.3,2.17,2.3,0,4
+13,my_player,v4i_walls15,my_player,40.0,2,white,goal,61,35.7,32.15,2.17,2.3,2.16,2.28,1,2
+14,v4i_walls15,my_player,my_player,40.0,2,black,goal,84,37.08,34.74,2.17,2.3,2.16,2.3,0,0
+15,my_player,v4i_walls15,my_player,40.0,2,white,goal,63,35.96,32.47,2.18,2.3,2.16,2.3,1,1

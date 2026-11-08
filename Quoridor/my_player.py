@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import random
 import time
+from collections import deque
 from math import inf
 
 from actions_quoridor import Orientation, Wall
@@ -22,17 +23,35 @@ class _TimeUp(Exception):
 
 # Heuristic weights, tuned empirically against greedy_player_quoridor.py / random_player_quoridor.py.
 W_DISTANCE = 25.0
-W_WALLS = 2.0
+W_WALLS = 31.0            # from a logistic fit of 6159 positions on game outcome (implied 31.7),
+                           # the ratio in grantslatton.com/solving-quoridor, and Glendenning 2005;
+                           # 2.0 was far too low and we burned all 10 walls in nearly every loss
 W_MOBILITY = 0.2
+W_VULNERABILITY = 6.0      # cost of each extra step the opponent's best wall could force on us
+VULNERABILITY_RANGE = 5    # only assess this near the goal, where being sealed in actually loses
+MAX_DAMAGE_PROBES = 12     # walls tried per assessment, to bound the cost of the term
 
 WIN_SCORE = 1_000_000.0
 NO_PATH_SCORE = 500_000.0
 
 SAFETY_MARGIN = 1.0        # seconds always left unspent, to absorb IPC/serialization latency
 MIN_BUDGET = 0.05
-MAX_MOVE_BUDGET = 30.0     # no single move may claim more than this, whatever the estimate says
+MAX_MOVE_BUDGET = 15.0     # no single move may claim more than this, whatever the estimate says
 MAX_BUDGET_FRACTION = 0.2  # nor more than this share of the time left, so the tail can never run dry
 MIN_MOVES_LEFT = 12        # floor on the remaining-move estimate, for the same reason
+OPENING_PLIES = 16         # the opening is near-forced advancing; thinking longer there buys nothing
+OPENING_BUDGET = 2.5       # real games had 19 opening moves pinned at the old 30s cap: 570s wasted
+HISTORY_LENGTH = 6         # how many of my own recent squares to remember
+W_REPETITION = 8.0         # penalty for stepping back onto a recent square, at the root only.
+                           # Small against W_DISTANCE=25, so a genuinely necessary detour around
+                           # a wall still wins, but an A-B-A oscillation does not.
+STALL_PLIES = 150          # past this, escalate the penalty until repetition is impossible.
+STALL_GROWTH = 20.0        # plies per doubling of the penalty once escalation starts.
+                           # Why: when a player is losing every line, minimax prefers the loss
+                           # that is furthest away, so shuffling forever outscores advancing.
+                           # A real match did exactly that for 2992 plies and was cancelled,
+                           # which got the agent rejected. Escalation makes that impossible:
+                           # by ~ply 300 stepping back costs more than a whole step of distance.
 MAX_WALL_CANDIDATES = 24   # branching-factor cap for wall moves considered at any search node
 MAX_TT_ENTRIES = 200_000
 MAX_DEPTH = 30
@@ -103,6 +122,16 @@ class _Geometry:
 
         self.row_of = [cell // dim for cell in range(size)]
 
+        # Left-right mirror. The board is symmetric about the middle column and
+        # both goals are rows, so a position and its mirror have equal value.
+        # Verified empirically: horizontal walls map c -> dim-2-c and vertical
+        # walls c -> dim-c (an earlier version used dim-1-c for vertical, which
+        # is wrong and made the table equate non-equivalent positions).
+        self.mirror_cell = [row * dim + (dim - 1 - col)
+                            for row in range(dim) for col in range(dim)]
+        self.mirror_h_col = [dim - 2 - c for c in range(dim)]
+        self.mirror_v_col = [dim - c for c in range(dim)]
+
     def _horizontal_edges(self, row: int, col: int) -> list[tuple[int, int]]:
         """A horizontal wall at (row, col) closes the two north-south crossings beneath it."""
         dim = self.dim
@@ -144,7 +173,8 @@ class _Zobrist:
         size = dim * dim
         bits = 64
         self.h_wall = [[rng.getrandbits(bits) for _ in range(dim)] for _ in range(dim)]
-        self.v_wall = [[rng.getrandbits(bits) for _ in range(dim)] for _ in range(dim)]
+        # dim+1 columns: a vertical wall at column 0 mirrors to column dim.
+        self.v_wall = [[rng.getrandbits(bits) for _ in range(dim + 1)] for _ in range(dim)]
         self.pawn = [[rng.getrandbits(bits) for _ in range(size)] for _ in range(2)]
         self.walls_left = [[rng.getrandbits(bits) for _ in range(32)] for _ in range(2)]
         self.side = rng.getrandbits(bits)
@@ -166,7 +196,8 @@ class _Board:
     """
 
     __slots__ = ("geo", "zobrist", "dim", "blocked", "h_walls", "v_walls",
-                 "pawns", "goals", "walls_left", "player_ids", "turn", "hash")
+                 "pawns", "goals", "walls_left", "player_ids", "turn", "hash",
+                 "hash_mirror")
 
     def __init__(self, state: GameStateQuoridor, my_id: int) -> None:
         dim = state.rep.dimension
@@ -194,25 +225,42 @@ class _Board:
             self._place_wall_bits(wall.orientation == Orientation.HORIZONTAL, wall.row, wall.col)
 
         self.turn = 0 if state.active_player.id == my_id else 1
-        self.hash = self._full_hash()
+        self.hash, self.hash_mirror = self._full_hashes()
 
     # ------------------------------------------------------------------
     # Hashing
     # ------------------------------------------------------------------
 
-    def _full_hash(self) -> int:
-        z = self.zobrist
-        value = 0
+    def _full_hashes(self) -> tuple[int, int]:
+        """Hash of this position, and of its left-right mirror."""
+        z, geo = self.zobrist, self.geo
+        value = mirrored = 0
         for row, col in self.h_walls:
             value ^= z.h_wall[row][col]
+            mirrored ^= z.h_wall[row][geo.mirror_h_col[col]]
         for row, col in self.v_walls:
             value ^= z.v_wall[row][col]
+            mirrored ^= z.v_wall[row][geo.mirror_v_col[col]]
         for player in (0, 1):
             value ^= z.pawn[player][self.pawns[player]]
-            value ^= z.walls_left[player][self.walls_left[player]]
+            mirrored ^= z.pawn[player][geo.mirror_cell[self.pawns[player]]]
+            left = z.walls_left[player][self.walls_left[player]]
+            value ^= left
+            mirrored ^= left
         if self.turn:
             value ^= z.side
-        return value
+            mirrored ^= z.side
+        return value, mirrored
+
+    def tt_key(self, depth: int) -> tuple[tuple, bool]:
+        """
+        Canonical transposition key: the smaller of the two hashes, so a
+        position and its mirror share one entry. The flag says whether the
+        mirrored form won, which tells the caller to mirror stored moves.
+        """
+        if self.hash_mirror < self.hash:
+            return (self.hash_mirror, depth), True
+        return (self.hash, depth), False
 
     # ------------------------------------------------------------------
     # Wall bookkeeping
@@ -241,7 +289,10 @@ class _Board:
         previous = self.pawns[player]
         z = self.zobrist
         self.pawns[player] = cell
+        mirror = self.geo.mirror_cell
         self.hash ^= z.pawn[player][previous] ^ z.pawn[player][cell] ^ z.side
+        self.hash_mirror ^= (z.pawn[player][mirror[previous]]
+                             ^ z.pawn[player][mirror[cell]] ^ z.side)
         self.turn ^= 1
         return previous
 
@@ -251,7 +302,10 @@ class _Board:
         cell = self.pawns[player]
         z = self.zobrist
         self.pawns[player] = previous
+        mirror = self.geo.mirror_cell
         self.hash ^= z.pawn[player][cell] ^ z.pawn[player][previous] ^ z.side
+        self.hash_mirror ^= (z.pawn[player][mirror[cell]]
+                             ^ z.pawn[player][mirror[previous]] ^ z.side)
 
     def make_wall(self, is_horizontal: bool, row: int, col: int) -> None:
         player = self.turn
@@ -260,7 +314,10 @@ class _Board:
         self.walls_left[player] = left - 1
         z = self.zobrist
         table = z.h_wall if is_horizontal else z.v_wall
-        self.hash ^= table[row][col] ^ z.walls_left[player][left] ^ z.walls_left[player][left - 1] ^ z.side
+        mirror_col = (self.geo.mirror_h_col if is_horizontal else self.geo.mirror_v_col)[col]
+        shared = z.walls_left[player][left] ^ z.walls_left[player][left - 1] ^ z.side
+        self.hash ^= table[row][col] ^ shared
+        self.hash_mirror ^= table[row][mirror_col] ^ shared
         self.turn ^= 1
 
     def unmake_wall(self, is_horizontal: bool, row: int, col: int) -> None:
@@ -271,7 +328,10 @@ class _Board:
         self.walls_left[player] = left + 1
         z = self.zobrist
         table = z.h_wall if is_horizontal else z.v_wall
-        self.hash ^= table[row][col] ^ z.walls_left[player][left] ^ z.walls_left[player][left + 1] ^ z.side
+        mirror_col = (self.geo.mirror_h_col if is_horizontal else self.geo.mirror_v_col)[col]
+        shared = z.walls_left[player][left] ^ z.walls_left[player][left + 1] ^ z.side
+        self.hash ^= table[row][col] ^ shared
+        self.hash_mirror ^= table[row][mirror_col] ^ shared
 
     # ------------------------------------------------------------------
     # Pawn moves (mirrors GameStateQuoridor._try_direction, jumps included)
@@ -386,13 +446,63 @@ class _Board:
         row = self.geo.neighbours[self.pawns[player]]
         return sum(1 for d in range(4) if row[d] >= 0 and not mask & (1 << d))
 
+    def worst_wall_damage(self, victim: int, placer: int, budget: int = MAX_DAMAGE_PROBES) -> int:
+        """
+        How many extra steps the single best wall by `placer` would cost `victim`.
+
+        This is the "can my path be cut?" question. Real games showed the agent
+        sprinting to within 2-3 steps of its goal along a single route and then
+        being sealed in, falling back 20+ steps. A seal takes several walls to
+        build, so it lies past any depth the search can reach — a horizon
+        effect, and the standard answer is to evaluate the threat statically.
+        """
+        if self.walls_left[placer] <= 0:
+            return 0
+        base = self.distance(victim)
+        if base is None:
+            return 0
+        path = self.shortest_path_cells(victim)
+        if len(path) < 2:
+            return 0
+
+        neighbours = self.geo.neighbours
+        blockers = self.geo.blockers
+        seen = set()
+        worst = 0
+        probes = 0
+
+        for cell, nxt in zip(path, path[1:]):
+            direction = -1
+            for d in range(4):
+                if neighbours[cell][d] == nxt:
+                    direction = d
+                    break
+            if direction < 0:
+                continue
+            for candidate in blockers[cell][direction]:
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if probes >= budget:
+                    return worst
+                is_horizontal, row, col = candidate
+                if not self.wall_legal(is_horizontal, row, col, placer):
+                    continue
+                probes += 1
+                self._place_wall_bits(is_horizontal, row, col)
+                after = self.distance(victim)
+                self._clear_wall_bits(is_horizontal, row, col)
+                if after is not None and after - base > worst:
+                    worst = after - base
+        return worst
+
     # ------------------------------------------------------------------
     # Wall legality (mirrors GameStateQuoridor._is_wall_legal exactly)
     # ------------------------------------------------------------------
 
-    def wall_legal(self, is_horizontal: bool, row: int, col: int) -> bool:
+    def wall_legal(self, is_horizontal: bool, row: int, col: int, placer: int | None = None) -> bool:
         dim = self.dim
-        if self.walls_left[self.turn] <= 0:
+        if self.walls_left[self.turn if placer is None else placer] <= 0:
             return False
         if not (0 <= row < dim and 0 <= col < dim):
             return False
@@ -478,7 +588,10 @@ class MyPlayer(PlayerQuoridor):
             name (str, optional): Name of the player (default is "bob")
         """
         super().__init__(piece_type, goal_row, name, *args, **kwargs)
-        self._tt = {}  # transposition table; prefixed with `_` so it stays out of the JSON export
+        # All underscore-prefixed, so none of this reaches the public game JSON.
+        self._tt = {}           # transposition table
+        self._recent = deque(maxlen=HISTORY_LENGTH)  # my own recent pawn squares
+        self._last_step = None  # to detect a new game on a reused instance
 
     # ------------------------------------------------------------------
     # Entry point
@@ -500,8 +613,9 @@ class MyPlayer(PlayerQuoridor):
         # method does counts against the move's budget.
         start = time.perf_counter()
 
+        self._record_position(current_state)
         board = _Board(current_state, current_state.active_player.id)
-        deadline = start + self._time_budget(board, remaining_time)
+        deadline = start + self._time_budget(board, remaining_time, current_state.get_step())
 
         actions = self._candidate_actions(board)
         if not actions:
@@ -525,7 +639,7 @@ class MyPlayer(PlayerQuoridor):
 
         return self._to_engine_action(best_action, current_state)
 
-    def _time_budget(self, board: _Board, remaining_time: float) -> float:
+    def _time_budget(self, board: _Board, remaining_time: float, step: int = 0) -> float:
         """
         Share of the whole-game budget granted to this move.
 
@@ -534,6 +648,12 @@ class MyPlayer(PlayerQuoridor):
         ever claiming an absurd slice: an absolute ceiling, a fraction of what
         is left, and a floor under the remaining-move estimate. Without them
         an endgame estimate of "4 moves left" granted 225s for one move.
+
+        The opening gets a much smaller slice. Real tournament games showed 19
+        consecutive opening moves pinned at the old 30s ceiling, 570s of the
+        900s budget, once leaving only 59s for the rest of the game — and the
+        opening is where extra depth is provably worth least, since both pawns
+        simply advance. An opponent beat us using 3.7s a move.
         """
         if remaining_time <= SAFETY_MARGIN:
             return 0.0
@@ -543,7 +663,8 @@ class MyPlayer(PlayerQuoridor):
         moves_left_estimate = max(MIN_MOVES_LEFT, my_distance + my_walls)
 
         usable = remaining_time - SAFETY_MARGIN
-        budget = min(usable / moves_left_estimate, MAX_MOVE_BUDGET, usable * MAX_BUDGET_FRACTION)
+        ceiling = OPENING_BUDGET if step < OPENING_PLIES else MAX_MOVE_BUDGET
+        budget = min(usable / moves_left_estimate, ceiling, usable * MAX_BUDGET_FRACTION)
         return max(min(MIN_BUDGET, usable), budget)
 
     # ------------------------------------------------------------------
@@ -563,9 +684,10 @@ class MyPlayer(PlayerQuoridor):
         budget runs out before every root action has been explored (the
         partial result is then discarded by the caller).
         """
-        tt_key = (board.hash, depth)
+        tt_key, mirrored = board.tt_key(depth)
         cached = self._tt.get(tt_key)
-        actions = self._order_actions(board, actions, cached[2] if cached else None)
+        hint = self._mirror_action(board, cached[2]) if (cached and mirrored) else (cached[2] if cached else None)
+        actions = self._order_actions(board, actions, hint)
 
         alpha, beta = -inf, inf
         best_action = None
@@ -576,15 +698,20 @@ class MyPlayer(PlayerQuoridor):
             value = self._alphabeta(board, depth - 1, alpha, beta, False, deadline)
             self._unmake(board, action, undo)
 
-            if value > best_value:
-                best_value = value
+            # The repetition penalty is applied only here, to pick between root
+            # moves. Alpha still tracks the raw value, so pruning stays sound
+            # and the penalty never leaks into the search tree's evaluations.
+            adjusted = value - self._repetition_cost(board, action)
+            if adjusted > best_value:
+                best_value = adjusted
                 best_action = action
             alpha = max(alpha, value)
 
         # Root search always uses the full (-inf, inf) window, so a completed
         # pass never fails high/low: the value is always exact here.
         if best_action is not None:
-            self._store_tt(tt_key, best_value, "EXACT", best_action)
+            stored = self._mirror_action(board, best_action) if mirrored else best_action
+            self._store_tt(tt_key, best_value, "EXACT", stored)
 
         return best_action, best_value
 
@@ -614,12 +741,14 @@ class MyPlayer(PlayerQuoridor):
             return self._evaluate(board)
 
         alpha_orig, beta_orig = alpha, beta
-        tt_key = (board.hash, depth)
+        tt_key, mirrored = board.tt_key(depth)
         cached = self._tt.get(tt_key)
         tt_move = None
 
         if cached is not None:
             cached_value, cached_flag, tt_move = cached
+            if mirrored and tt_move is not None:
+                tt_move = self._mirror_action(board, tt_move)
             if cached_flag == "EXACT":
                 return cached_value
             if cached_flag == "LOWERBOUND":
@@ -664,8 +793,51 @@ class MyPlayer(PlayerQuoridor):
         else:
             flag = "EXACT"
 
+        if mirrored and best_action is not None:
+            best_action = self._mirror_action(board, best_action)
         self._store_tt(tt_key, best_value, flag, best_action)
         return best_value
+
+    def _record_position(self, state: GameStateQuoridor) -> None:
+        """
+        Remember where my pawn has just been, so the root can refuse to walk
+        back onto it. Clears when the step counter goes backwards, which means
+        a new game started on a reused player instance.
+        """
+        step = state.get_step()
+        if self._last_step is not None and step < self._last_step:
+            self._recent.clear()
+            self._tt.clear()
+        self._last_step = step
+
+        position = state.rep.pawn_positions[self.id]
+        if not self._recent or self._recent[-1] != position:
+            self._recent.append(position)
+
+    def _repetition_cost(self, board: _Board, action: tuple) -> float:
+        """Cost of returning to a recently occupied square; the more recent, the worse."""
+        if action[0] != "move" or not self._recent:
+            return 0.0
+        destination = (action[1] // board.dim, action[1] % board.dim)
+        # _recent[-1] is the square I am standing on, which no move can target,
+        # so age starts at 1: the square I just came from carries the full cost.
+        for age, position in enumerate(reversed(self._recent)):
+            if age and position == destination:
+                overtime = max(0, (self._last_step or 0) - STALL_PLIES)
+                return (W_REPETITION / age) * (1.0 + overtime / STALL_GROWTH)
+        return 0.0
+
+    @staticmethod
+    def _mirror_action(board: _Board, action: tuple | None) -> tuple | None:
+        """Same action seen in the mirrored frame, so a move hint stored under
+        the canonical key still names a real move in this position."""
+        if action is None:
+            return None
+        if action[0] == "move":
+            return ("move", board.geo.mirror_cell[action[1]])
+        is_horizontal, row, col = action[1], action[2], action[3]
+        table = board.geo.mirror_h_col if is_horizontal else board.geo.mirror_v_col
+        return ("wall", is_horizontal, row, table[col])
 
     def _store_tt(self, key: tuple, value: float, flag: str, action: tuple | None) -> None:
         if len(self._tt) >= MAX_TT_ENTRIES:
@@ -756,11 +928,21 @@ class MyPlayer(PlayerQuoridor):
         if opponent_distance is None:
             return NO_PATH_SCORE
 
-        return (
+        score = (
             W_DISTANCE * (opponent_distance - my_distance)
             + W_WALLS * (board.walls_left[0] - board.walls_left[1])
             + W_MOBILITY * (board.mobility(0) - board.mobility(1))
         )
+
+        # Being three steps from the goal on a route the opponent can cut is
+        # worth far less than it looks. Only assessed near the goal: that is
+        # where a seal is fatal, and it keeps this costly term off most leaves.
+        if my_distance <= VULNERABILITY_RANGE:
+            score -= W_VULNERABILITY * board.worst_wall_damage(0, 1)
+        if opponent_distance <= VULNERABILITY_RANGE:
+            score += W_VULNERABILITY * board.worst_wall_damage(1, 0)
+
+        return score
 
     def _fallback_action(self, board: _Board, actions: list[tuple]) -> tuple:
         """
