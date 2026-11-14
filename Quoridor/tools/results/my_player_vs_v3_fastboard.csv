@@ -187,3 +187,4 @@ game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_
 33,v3_fastboard,my_player,v3_fastboard,40.0,2,white,goal,67,36.2,34.16,2.17,2.2,2.17,2.2,1,0
 34,my_player,v3_fastboard,my_player,40.0,2,white,goal,79,31.65,29.05,2.17,2.17,2.16,2.14,0,0
 35,v3_fastboard,my_player,my_player,40.0,2,black,goal,92,35.96,35.69,2.18,2.17,2.16,2.17,0,0
+0,my_player,v3_fastboard,my_player,900.0,2,white,goal,223,335.36,899.0,20.05,30.0,19.89,29.67,2,0

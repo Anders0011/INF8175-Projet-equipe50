@@ -239,7 +239,9 @@ def main() -> None:
     # reflects its style gets credited for winning, and the fit learns "which
     # agent is this" instead of "is this position good". Diversity comes from
     # --random-plies instead. Pass --agents only to study style differences.
-    c.add_argument("--agents", nargs="*", default=["my_player.py"])
+    # Default is the V4 snapshot: the features above (mobility in particular)
+    # are read from its board, which V5's leaner board no longer provides.
+    c.add_argument("--agents", nargs="*", default=["versions/v4l_symmetry.py"])
     c.set_defaults(func=collect)
 
     f = sub.add_parser("fit")

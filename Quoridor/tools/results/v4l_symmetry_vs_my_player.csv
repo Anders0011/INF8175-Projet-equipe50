@@ -1,0 +1,2 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_max_move_cpu,black_max_move_cpu,white_walls_left,black_walls_left
+0,v4l_symmetry,my_player,my_player,900.0,2,black,goal,68,257.87,249.12,15.02,20.02,14.89,19.75,0,0

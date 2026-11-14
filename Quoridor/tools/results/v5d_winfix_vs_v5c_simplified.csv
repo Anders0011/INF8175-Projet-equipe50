@@ -1,0 +1,13 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_max_move_cpu,black_max_move_cpu,white_walls_left,black_walls_left
+0,v5d_winfix,v5c_simplified,v5c_simplified,60.0,2,black,goal,72,44.34,48.42,3.29,3.47,3.27,3.45,1,1
+1,v5c_simplified,v5d_winfix,v5d_winfix,60.0,2,black,goal,72,44.93,48.1,3.42,3.45,3.41,3.45,1,1
+2,v5d_winfix,v5c_simplified,v5d_winfix,60.0,2,white,goal,63,45.01,41.12,3.64,3.93,3.62,3.91,0,3
+3,v5c_simplified,v5d_winfix,v5c_simplified,60.0,2,white,goal,75,45.01,41.43,3.63,3.93,3.61,3.92,0,0
+4,v5d_winfix,v5c_simplified,v5d_winfix,60.0,2,white,goal,77,46.82,41.52,3.44,3.55,3.44,3.53,0,2
+5,v5c_simplified,v5d_winfix,v5d_winfix,60.0,2,black,goal,78,45.32,43.12,3.45,3.53,3.44,3.55,0,0
+6,v5d_winfix,v5c_simplified,v5d_winfix,60.0,2,white,goal,65,45.65,41.51,3.57,2.99,3.53,2.98,1,3
+7,v5c_simplified,v5d_winfix,v5c_simplified,60.0,2,white,goal,67,46.16,38.89,3.56,3.54,3.55,3.52,0,4
+8,v5d_winfix,v5c_simplified,v5d_winfix,60.0,2,white,goal,49,39.59,34.18,3.63,3.34,3.56,3.33,1,5
+9,v5c_simplified,v5d_winfix,v5c_simplified,60.0,2,white,goal,49,39.59,34.47,3.63,3.34,3.61,3.33,1,5
+10,v5d_winfix,v5c_simplified,v5d_winfix,60.0,2,white,goal,61,46.57,38.71,3.56,3.53,3.55,3.53,0,6
+11,v5c_simplified,v5d_winfix,v5c_simplified,60.0,2,white,goal,67,44.99,38.87,3.56,3.53,3.55,3.5,0,4

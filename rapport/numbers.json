@@ -1,0 +1,13 @@
+{
+ "ms_per_node": "0,1",
+ "branching": "17 à 18",
+ "pass_ratio": "2,8",
+ "positions": 16,
+ "fig_pruning_ratio": 0.4478,
+ "fig_matches_ratio": 0.6055,
+ "time_sentence": "Dans deux parties complètes au budget réel de 900 s, contre la V4 puis la V3, l'agent a utilisé 249 s et 335 s, et son coup le plus long a duré 20,05 s, soit le plafond à 0,05 s près.",
+ "pruning_text": "Les trois courbes utilisent le même générateur de coups : l'écart mesure donc l'élagage seul, et non le filtrage des murs. À profondeur 4, le minimax visite 97 398 positions, l'alpha-bêta à variation principale 1 123 et l'agent final 963, soit cent fois moins. Chaque demi-coup supplémentaire multiplie le travail par 18 pour le minimax et par 2,8 pour l'agent final, sous la valeur √18 ≈ 4,2 d'un alpha-bêta idéalement ordonné. L'agent termine ainsi la profondeur 8 (64 192 positions) en visitant moins de positions que le minimax à la profondeur 4. Les réductions des coups tardifs comptent pour un facteur 1,6 à profondeur 6 (8 335 contre 13 157) sans changer le coup choisi sur aucune des 16 positions. À l'inverse, deux raffinements n'apportent rien de mesurable ici : réutiliser les entrées de table plus profondes et les clés symétriques modifie le compte de moins de 0,2 %. En temps, l'agent traite environ 9 700 positions par seconde et termine la profondeur 8 en 9 s (médiane ; de 0,4 à 28 s selon la position), quand la V4 demandait 16 à 25 s pour la profondeur 6.",
+ "v5_sentence": "10 – 2 contre la V4 corrigée, puis huit victoires et une nulle en neuf parties contre la V3, à 150 s par agent, ainsi que deux victoires en deux parties au budget réel de 900 s, une contre chacune.",
+ "depth_sentence": "terminant couramment la profondeur 7 ou 8 dans le budget d'un coup, là où la V4 atteignait 5 ou 6.",
+ "limit_sentence": "(4) Les scores de victoire stockés dans la table demandent de la prudence. Une partie contre la V3 avait atteint la limite de 400 demi-coups sans vainqueur : en avance de quinze pas, l'agent alternait entre deux cases. La table lui rendait une victoire prouvée lors d'une recherche antérieure plus profonde, l'approfondissement s'arrêtait alors dès la profondeur 2, et le retour vers cette position connue l'emportait sur l'avance, pas encore prouvée gagnante. L'agent final ne réutilise plus une telle valeur qu'à profondeur égale : la même partie, rejouée, est gagnée en 71 demi-coups sans aucun aller-retour, et un match de contrôle contre la version précédente donne 7 – 5 en 12 parties. Les matchs de la figure 2 sont antérieurs à ce correctif. (5) Le temps est sous-employé : 249 s et 335 s sur 900 dans les deux parties complètes citées plus haut."
+}

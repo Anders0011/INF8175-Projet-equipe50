@@ -1,0 +1,82 @@
+[
+ {
+  "heading": "Versions soumises",
+  "items": [
+   [
+    "V1 contre l'agent glouton fourni",
+    10,
+    10
+   ],
+   [
+    "V2 contre V1",
+    11,
+    26
+   ],
+   [
+    "V3 contre V1",
+    10,
+    20
+   ],
+   [
+    "V4 contre V3",
+    39,
+    51
+   ],
+   [
+    "V4 corrigée contre V4",
+    15,
+    30
+   ],
+   [
+    "V5 contre V4 corrigée",
+    10,
+    12
+   ],
+   [
+    "V5 contre V3",
+    8.5,
+    9
+   ]
+  ]
+ },
+ {
+  "heading": "Composantes testées isolément",
+  "items": [
+   [
+    "Évaluation exacte des finales",
+    7,
+    16
+   ],
+   [
+    "Comptage de chemins",
+    57,
+    136
+   ],
+   [
+    "Vulnérabilité (aux feuilles)",
+    17,
+    36
+   ],
+   [
+    "Poids des murs à 1,24 pas",
+    20,
+    36
+   ],
+   [
+    "Poids des murs à 0,6 pas",
+    5,
+    16
+   ],
+   [
+    "Vulnérabilité à la racine",
+    17,
+    60
+   ],
+   [
+    "Clés de table symétriques",
+    15,
+    30
+   ]
+  ]
+ }
+]

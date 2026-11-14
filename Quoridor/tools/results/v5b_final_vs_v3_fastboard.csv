@@ -1,0 +1,11 @@
+game,white,black,winner_name,time_budget,random_plies,winner,reason,steps,white_time_used,black_time_used,white_max_move,black_max_move,white_max_move_cpu,black_max_move_cpu,white_walls_left,black_walls_left
+0,v5b_final,v3_fastboard,draw,150.0,2,draw,max_steps,400,104.23,124.35,8.76,8.76,8.72,8.75,0,1
+1,v3_fastboard,v5b_final,v5b_final,150.0,2,black,goal,62,135.66,102.44,8.29,9.16,8.2,9.16,0,9
+2,v5b_final,v3_fastboard,v5b_final,150.0,2,white,goal,39,84.95,99.48,9.58,8.28,9.56,8.27,4,6
+3,v3_fastboard,v5b_final,v5b_final,150.0,2,black,goal,78,136.66,113.14,8.77,8.63,8.73,8.62,0,2
+4,v5b_final,v3_fastboard,v5b_final,150.0,2,white,goal,71,109.93,136.45,8.85,8.28,8.83,8.28,0,0
+5,v3_fastboard,v5b_final,v5b_final,150.0,2,black,goal,70,133.6,122.26,8.28,8.59,8.27,8.58,0,2
+6,v5b_final,v3_fastboard,v5b_final,150.0,2,white,goal,69,116.99,120.29,8.97,8.77,8.95,8.72,1,1
+7,v3_fastboard,v5b_final,v5b_final,150.0,2,black,goal,62,128.01,100.34,8.28,9.16,8.22,9.12,0,5
+8,v5b_final,v3_fastboard,v5b_final,150.0,2,white,goal,39,85.28,99.48,9.57,8.28,9.58,8.27,4,6
+9,v3_fastboard,v5b_final,v3_fastboard,150.0,2,white,timeout,5,17.53,9364.17,8.77,9363.67,8.75,2.98,10,10

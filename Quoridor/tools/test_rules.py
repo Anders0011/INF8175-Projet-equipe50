@@ -8,9 +8,11 @@ At every sampled position it checks:
   - pawn destinations match the engine's _legal_moves() (jumps, diagonals)
   - wall legality matches _is_wall_legal() for EVERY slot on the board
   - distances match the engine's _shortest_path()
-  - make/unmake restores the board exactly, Zobrist hash included
-  - every candidate the agent generates really is legal per the engine
-  - worst_wall_damage() leaves the board untouched (it mutates and restores)
+  - make/unmake restores the board exactly, both Zobrist hashes included
+  - every root move the agent generates really is legal per the engine
+  - shortest_path() agrees with distance(), and a wall that closes no crossing
+    of a player's shortest path really leaves that player's distance unchanged
+    (the search relies on this to skip path searches)
 
 Usage:
     python tools/test_rules.py [games]
@@ -43,7 +45,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def snapshot(board: _Board):
-    return (list(board.blocked), set(board.h_walls), set(board.v_walls),
+    return (list(board.blocked), bytes(board.occupied),
             list(board.pawns), list(board.walls_left), board.turn,
             board.hash, board.hash_mirror)
 
@@ -60,41 +62,67 @@ def compare(state: GameStateQuoridor, tag: str) -> None:
     check(engine_moves == fast_moves,
           f"{tag}: moves differ engine={sorted(engine_moves)} fast={sorted(fast_moves)}")
 
+    geo = board.geo
     for row in range(dim):
         for col in range(dim):
             for is_h, orientation in ((True, Orientation.HORIZONTAL), (False, Orientation.VERTICAL)):
                 engine_ok = state._is_wall_legal(Wall(row, col, orientation))
-                fast_ok = board.wall_legal(is_h, row, col)
+                code = geo.h_code(row, col) if is_h else geo.v_code(row, col)
+                fast_ok = board.wall_legal(code)
                 check(engine_ok == fast_ok,
                       f"{tag}: wall {'H' if is_h else 'V'}({row},{col}) "
                       f"engine={engine_ok} fast={fast_ok}")
 
-    check(board.distance(0) == state._shortest_path(me), f"{tag}: distance p0 differs")
-    check(board.distance(1) == state._shortest_path(other), f"{tag}: distance p1 differs")
+    distances = [board.distance(0), board.distance(1)]
+    check(distances[0] == state._shortest_path(me), f"{tag}: distance p0 differs")
+    check(distances[1] == state._shortest_path(other), f"{tag}: distance p1 differs")
 
-    # worst_wall_damage places and removes walls internally; it must restore.
+    paths = [board.shortest_path(0), board.shortest_path(1)]
+    crossings = [board.crossings(paths[0]), board.crossings(paths[1])]
+    for player in (0, 1):
+        check(len(paths[player]) - 1 == distances[player], f"{tag}: path length p{player} differs")
+        check(board.has_path(player), f"{tag}: has_path p{player} is False on a legal position")
+
+    # The shortcut the search depends on: a wall that closes no crossing of a
+    # shortest path cannot change that player's distance.
     before = snapshot(board)
-    damage = board.worst_wall_damage(0, 1)
-    check(snapshot(board) == before, f"{tag}: worst_wall_damage corrupted the board")
-    check(damage >= 0, f"{tag}: negative damage {damage}")
+    for code in probe._wall_candidates(board, paths[0], paths[1]):
+        board.place(code)
+        for player in (0, 1):
+            if geo.wall_cuts[code].isdisjoint(crossings[player]):
+                check(board.distance(player) == distances[player],
+                      f"{tag}: wall {code} misses p{player}'s path but changed its distance")
+        board.remove(code)
+    check(snapshot(board) == before, f"{tag}: place/remove did not restore the board")
 
-    before = snapshot(board)
-    for action in probe._candidate_actions(board):
-        undo = probe._make(board, action)
-        expected_hash, expected_mirror = board._full_hashes()
-        check(board.hash == expected_hash, f"{tag}: hash desync after {action}")
-        check(board.hash_mirror == expected_mirror,
-              f"{tag}: MIRROR hash desync after {action}")
-        probe._unmake(board, action, undo)
-        check(snapshot(board) == before, f"{tag}: unmake did not restore after {action}")
-
-        if action[0] == "wall":
-            orientation = Orientation.HORIZONTAL if action[1] else Orientation.VERTICAL
-            check(state._is_wall_legal(Wall(action[2], action[3], orientation)),
-                  f"{tag}: generated ILLEGAL wall {action}")
+    size = board.size
+    for move in probe._root_moves(board):
+        if move < size:
+            previous = board.make_move(move)
         else:
-            check((action[1] // dim, action[1] % dim) in engine_moves,
-                  f"{tag}: generated ILLEGAL move {action}")
+            board.make_wall(move)
+        expected_hash, expected_mirror = board._full_hashes()
+        check(board.hash == expected_hash, f"{tag}: hash desync after {move}")
+        check(board.hash_mirror == expected_mirror, f"{tag}: MIRROR hash desync after {move}")
+        if move < size:
+            board.unmake_move(previous)
+        else:
+            board.unmake_wall(move)
+        check(snapshot(board) == before, f"{tag}: unmake did not restore after {move}")
+
+        if move < size:
+            check((move // dim, move % dim) in engine_moves, f"{tag}: generated ILLEGAL move {move}")
+        else:
+            orientation = Orientation.HORIZONTAL if move < 2 * size else Orientation.VERTICAL
+            row, col = divmod(move % size, dim)
+            check(state._is_wall_legal(Wall(row, col, orientation)),
+                  f"{tag}: generated ILLEGAL wall {move}")
+
+    # Mirror table: mirroring twice is the identity wherever it is defined.
+    for code in range(3 * size):
+        image = geo.mirror_move[code]
+        if image >= 0:
+            check(geo.mirror_move[image] == code, f"{tag}: mirror of mirror of {code} is not itself")
 
 
 def main(games: int) -> None:

@@ -7,130 +7,150 @@ from __future__ import annotations
 import random
 import time
 from collections import deque
-from math import inf
 
 from actions_quoridor import Orientation, Wall
 from game_state_quoridor import GameStateQuoridor
 from player_quoridor import PlayerQuoridor
 from seahorse.game.action import Action
 from seahorse.game.stateless_action import StatelessAction
-from seahorse.player.player import Player
 
 
 class _TimeUp(Exception):
-    """Raised to unwind the search as soon as the per-move time budget is exhausted."""
+    """Raised when the time budget for the move runs out."""
 
 
-# Heuristic weights, tuned empirically against greedy_player_quoridor.py / random_player_quoridor.py.
-W_DISTANCE = 25.0
-W_WALLS = 31.0            # from a logistic fit of 6159 positions on game outcome (implied 31.7),
-                           # the ratio in grantslatton.com/solving-quoridor, and Glendenning 2005;
-                           # 2.0 was far too low and we burned all 10 walls in nearly every loss
-W_MOBILITY = 0.2
-W_VULNERABILITY = 6.0      # cost of each extra step the opponent's best wall could force on us
-VULNERABILITY_RANGE = 5    # only assess this near the goal, where being sealed in actually loses
-MAX_DAMAGE_PROBES = 12     # walls tried per assessment, to bound the cost of the term
+# Evaluation weights (integers, in hundredths of a pawn step)
+W_DISTANCE = 100           # one step of shortest-path lead
+W_WALLS = 124              # one wall in hand, about 1.24 steps (fitted on game outcomes)
+TEMPO = 50                 # bonus for the side to move, keeps leaves at different depths comparable
+WIN_SCORE = 10_000_000
+INFINITY = 1_000_000_000
 
-WIN_SCORE = 1_000_000.0
-NO_PATH_SCORE = 500_000.0
+# Search
+MAX_DEPTH = 40
+MAX_WALL_CANDIDATES = 28   # max wall slots considered per node
+MAX_TT_ENTRIES = 1_000_000   # about 200 MB
+GAIN_ORDER_MIN_DEPTH = 3   # from this depth, order walls by their real effect on both paths
+LMR_MIN_DEPTH = 3          # late-move reductions start at this remaining depth
+LMR_FULL_MOVES = 4         # moves searched at full depth before reducing
+HISTORY_MAX = 1 << 20
+CLOCK_CHECK_INTERVAL = 256  # nodes between two clock checks
 
-SAFETY_MARGIN = 1.0        # seconds always left unspent, to absorb IPC/serialization latency
+EXACT, LOWER, UPPER = 0, 1, 2
+
+# Time management (seconds)
+SAFETY_MARGIN = 3.0        # never spent, covers communication latency
 MIN_BUDGET = 0.05
-MAX_MOVE_BUDGET = 15.0     # no single move may claim more than this, whatever the estimate says
-MAX_BUDGET_FRACTION = 0.2  # nor more than this share of the time left, so the tail can never run dry
-MIN_MOVES_LEFT = 12        # floor on the remaining-move estimate, for the same reason
-OPENING_PLIES = 16         # the opening is near-forced advancing; thinking longer there buys nothing
-OPENING_BUDGET = 2.5       # real games had 19 opening moves pinned at the old 30s cap: 570s wasted
-HISTORY_LENGTH = 6         # how many of my own recent squares to remember
-W_REPETITION = 8.0         # penalty for stepping back onto a recent square, at the root only.
-                           # Small against W_DISTANCE=25, so a genuinely necessary detour around
-                           # a wall still wins, but an A-B-A oscillation does not.
-STALL_PLIES = 150          # past this, escalate the penalty until repetition is impossible.
-STALL_GROWTH = 20.0        # plies per doubling of the penalty once escalation starts.
-                           # Why: when a player is losing every line, minimax prefers the loss
-                           # that is furthest away, so shuffling forever outscores advancing.
-                           # A real match did exactly that for 2992 plies and was cancelled,
-                           # which got the agent rejected. Escalation makes that impossible:
-                           # by ~ply 300 stepping back costs more than a whole step of distance.
-MAX_WALL_CANDIDATES = 24   # branching-factor cap for wall moves considered at any search node
-MAX_TT_ENTRIES = 200_000
-MAX_DEPTH = 30
+MAX_MOVE_BUDGET = 20.0     # hard cap for one move
+MAX_BUDGET_FRACTION = 0.2  # max share of the remaining time for one move
+MIN_MOVES_LEFT = 12        # lower bound on the estimated moves left
+QUIET_OPENING_PLIES = 4    # first plies on an empty board are forced
+QUIET_OPENING_BUDGET = 1.0
+RACE_BUDGET = 0.5          # no walls left on either side: pure race
+NEXT_DEPTH_FRACTION = 0.45 # don't start a deeper pass after this share of the budget
+
+# Repetition penalty (root only)
+HISTORY_LENGTH = 6         # recent squares remembered
+W_REPETITION = 32          # penalty for going back to a recent square
+STALL_PLIES = 150          # after this ply the penalty starts growing
+STALL_GROWTH = 20.0        # plies per doubling of the penalty
 
 NORTH, SOUTH, WEST, EAST = 0, 1, 2, 3
-# Same order as GameStateQuoridor.DIRECTIONS, so move generation matches the engine's.
+# Same order as GameStateQuoridor.DIRECTIONS
 _DELTAS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+_OPPOSITE = (SOUTH, NORTH, EAST, WEST)
 _OPPOSITE_AXIS = ((WEST, EAST), (WEST, EAST), (NORTH, SOUTH), (NORTH, SOUTH))
 
 
-class _Geometry:
-    """
-    Board tables that depend only on the dimension, computed once and shared.
+# Moves are ints: cell for a pawn move, size + idx for a horizontal wall, 2*size + idx for a vertical one
 
-    The search runs on plain ints and bitmasks instead of the engine's Wall
-    objects and frozensets: rebuilding those at every node is what limited
-    the search to depth 2-3.
-    """
+
+class _Geometry:
+    """Board tables that only depend on the dimension, built once and shared."""
 
     _cache: dict[int, "_Geometry"] = {}
 
     def __init__(self, dim: int) -> None:
         self.dim = dim
-        size = dim * dim
+        size = self.size = dim * dim
 
+        self.row_of = [cell // dim for cell in range(size)]
         self.neighbours = [[-1] * 4 for _ in range(size)]
+        # direction[(a, b)]: direction of the step from cell a to its neighbour b
+        self.direction: dict[tuple[int, int], int] = {}
         for row in range(dim):
             for col in range(dim):
                 cell = row * dim + col
                 for direction, (d_row, d_col) in enumerate(_DELTAS):
                     n_row, n_col = row + d_row, col + d_col
                     if 0 <= n_row < dim and 0 <= n_col < dim:
-                        self.neighbours[cell][direction] = n_row * dim + n_col
+                        neighbour = n_row * dim + n_col
+                        self.neighbours[cell][direction] = neighbour
+                        self.direction[(cell, neighbour)] = direction
 
-        # Which (cell, direction) crossings each wall closes.
-        self.h_edges: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
-        self.v_edges: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
+        # Per wall code; a crossing (cell, direction) has id cell * 4 + direction
+        self.wall_valid = bytearray(3 * size)                    # slot is inside the board
+        self.wall_edges: list[tuple] = [()] * (3 * size)         # (cell, direction bit) pairs it closes
+        self.wall_cuts: list[frozenset] = [frozenset()] * (3 * size)   # crossing ids it closes
+        self.wall_conflicts: list[tuple] = [()] * (3 * size)     # slots it overlaps or crosses
         for row in range(dim):
             for col in range(dim):
-                self.h_edges[(row, col)] = tuple(self._horizontal_edges(row, col))
-                self.v_edges[(row, col)] = tuple(self._vertical_edges(row, col))
+                h_code, v_code = size + row * dim + col, 2 * size + row * dim + col
+                # Same bounds as GameStateQuoridor._is_wall_legal
+                self.wall_valid[h_code] = col < dim - 1
+                self.wall_valid[v_code] = row < dim - 1
+                for code, edges in ((h_code, self._horizontal_edges(row, col)),
+                                    (v_code, self._vertical_edges(row, col))):
+                    self.wall_edges[code] = tuple((cell, 1 << d) for cell, d in edges)
+                    self.wall_cuts[code] = frozenset(cell * 4 + d for cell, d in edges)
+                self.wall_conflicts[h_code] = tuple(
+                    code for code in (h_code, self.h_code(row, col + 1), self.h_code(row, col - 1),
+                                      self.v_code(row - 1, col + 1)) if code >= 0)
+                self.wall_conflicts[v_code] = tuple(
+                    code for code in (v_code, self.v_code(row - 1, col), self.v_code(row + 1, col),
+                                      self.h_code(row + 1, col - 1)) if code >= 0)
 
-        # Inverse table: which walls could close a given (cell, direction).
-        # Mirrors GameStateQuoridor._candidate_blocking_walls, bounds included.
-        self.blockers: list[list[tuple[tuple[bool, int, int], ...]]] = [
-            [() for _ in range(4)] for _ in range(size)
-        ]
+        # Walls that can close a given crossing (same as _candidate_blocking_walls)
+        self.blockers: list[list[tuple]] = [[() for _ in range(4)] for _ in range(size)]
         for row in range(dim):
             for col in range(dim):
                 cell = row * dim + col
                 south, north, east, west = [], [], [], []
                 if col > 0:
-                    south.append((True, row + 1, col - 1))
-                    north.append((True, row, col - 1))
+                    south.append(self.h_code(row + 1, col - 1))
+                    north.append(self.h_code(row, col - 1))
                 if col < dim - 1:
-                    south.append((True, row + 1, col))
-                    north.append((True, row, col))
+                    south.append(self.h_code(row + 1, col))
+                    north.append(self.h_code(row, col))
                 if row > 0:
-                    east.append((False, row - 1, col + 1))
-                    west.append((False, row - 1, col))
+                    east.append(self.v_code(row - 1, col + 1))
+                    west.append(self.v_code(row - 1, col))
                 if row < dim - 1:
-                    east.append((False, row, col + 1))
-                    west.append((False, row, col))
-                self.blockers[cell][SOUTH] = tuple(south)
-                self.blockers[cell][NORTH] = tuple(north)
-                self.blockers[cell][EAST] = tuple(east)
-                self.blockers[cell][WEST] = tuple(west)
+                    east.append(self.v_code(row, col + 1))
+                    west.append(self.v_code(row, col))
+                for direction, codes in ((SOUTH, south), (NORTH, north), (EAST, east), (WEST, west)):
+                    self.blockers[cell][direction] = tuple(c for c in codes if c >= 0)
 
-        self.row_of = [cell // dim for cell in range(size)]
+        # Left-right mirror: horizontal walls map c -> dim-2-c, vertical walls c -> dim-c
+        self.mirror_cell = [row * dim + (dim - 1 - col) for row in range(dim) for col in range(dim)]
+        # mirror_move[code]: same move on the mirrored board, -1 if it falls off the grid
+        self.mirror_move = [-1] * (3 * size)
+        for row in range(dim):
+            for col in range(dim):
+                cell = row * dim + col
+                self.mirror_move[cell] = self.mirror_cell[cell]
+                self.mirror_move[size + cell] = self.h_code(row, dim - 2 - col)
+                self.mirror_move[2 * size + cell] = self.v_code(row, dim - col)
 
-        # Left-right mirror. The board is symmetric about the middle column and
-        # both goals are rows, so a position and its mirror have equal value.
-        # Verified empirically: horizontal walls map c -> dim-2-c and vertical
-        # walls c -> dim-c (an earlier version used dim-1-c for vertical, which
-        # is wrong and made the table equate non-equivalent positions).
-        self.mirror_cell = [row * dim + (dim - 1 - col)
-                            for row in range(dim) for col in range(dim)]
-        self.mirror_h_col = [dim - 2 - c for c in range(dim)]
-        self.mirror_v_col = [dim - c for c in range(dim)]
+    def h_code(self, row: int, col: int) -> int:
+        """Code of the horizontal wall at (row, col), or -1 outside the grid."""
+        dim = self.dim
+        return self.size + row * dim + col if 0 <= row < dim and 0 <= col < dim else -1
+
+    def v_code(self, row: int, col: int) -> int:
+        """Code of the vertical wall at (row, col), or -1 outside the grid."""
+        dim = self.dim
+        return 2 * self.size + row * dim + col if 0 <= row < dim and 0 <= col < dim else -1
 
     def _horizontal_edges(self, row: int, col: int) -> list[tuple[int, int]]:
         """A horizontal wall at (row, col) closes the two north-south crossings beneath it."""
@@ -139,8 +159,8 @@ class _Geometry:
         if 1 <= row < dim:
             for c in (col, col + 1):
                 if 0 <= c < dim:
-                    edges.append(((row - 1) * dim + c, 1 << SOUTH))
-                    edges.append((row * dim + c, 1 << NORTH))
+                    edges.append(((row - 1) * dim + c, SOUTH))
+                    edges.append((row * dim + c, NORTH))
         return edges
 
     def _vertical_edges(self, row: int, col: int) -> list[tuple[int, int]]:
@@ -150,8 +170,8 @@ class _Geometry:
         if 1 <= col < dim:
             for r in (row, row + 1):
                 if 0 <= r < dim:
-                    edges.append((r * dim + col - 1, 1 << EAST))
-                    edges.append((r * dim + col, 1 << WEST))
+                    edges.append((r * dim + col - 1, EAST))
+                    edges.append((r * dim + col, WEST))
         return edges
 
     @classmethod
@@ -172,12 +192,24 @@ class _Zobrist:
         rng = random.Random(0x5EED)
         size = dim * dim
         bits = 64
-        self.h_wall = [[rng.getrandbits(bits) for _ in range(dim)] for _ in range(dim)]
+        h_keys = [[rng.getrandbits(bits) for _ in range(dim)] for _ in range(dim)]
         # dim+1 columns: a vertical wall at column 0 mirrors to column dim.
-        self.v_wall = [[rng.getrandbits(bits) for _ in range(dim + 1)] for _ in range(dim)]
+        v_keys = [[rng.getrandbits(bits) for _ in range(dim + 1)] for _ in range(dim)]
         self.pawn = [[rng.getrandbits(bits) for _ in range(size)] for _ in range(2)]
         self.walls_left = [[rng.getrandbits(bits) for _ in range(32)] for _ in range(2)]
         self.side = rng.getrandbits(bits)
+
+        # Per wall code: its own key, and the key of its mirror image.
+        self.wall = [0] * (3 * size)
+        self.wall_mirror = [0] * (3 * size)
+        for row in range(dim):
+            for col in range(dim):
+                h_code, v_code = size + row * dim + col, 2 * size + row * dim + col
+                self.wall[h_code] = h_keys[row][col]
+                self.wall[v_code] = v_keys[row][col]
+                # Off-grid mirrors close no crossing, any fixed key works
+                self.wall_mirror[h_code] = h_keys[row][(dim - 2 - col) % dim]
+                self.wall_mirror[v_code] = v_keys[row][dim - col]
 
     @classmethod
     def get(cls, dim: int) -> "_Zobrist":
@@ -189,22 +221,19 @@ class _Zobrist:
 
 
 class _Board:
-    """
-    Mutable board the search works on, with make/unmake instead of copying.
+    """Mutable board used by the search (make/unmake); player 0 is always us."""
 
-    Players are indexed 0/1 internally; `player_ids` maps back to engine ids.
-    """
-
-    __slots__ = ("geo", "zobrist", "dim", "blocked", "h_walls", "v_walls",
-                 "pawns", "goals", "walls_left", "player_ids", "turn", "hash",
-                 "hash_mirror")
+    __slots__ = ("geo", "zobrist", "dim", "size", "blocked", "occupied", "pawns", "goals",
+                 "walls_left", "player_ids", "turn", "hash", "hash_mirror")
 
     def __init__(self, state: GameStateQuoridor, my_id: int) -> None:
         dim = state.rep.dimension
         self.geo = _Geometry.get(dim)
         self.zobrist = _Zobrist.get(dim)
         self.dim = dim
-        self.blocked = [0] * (dim * dim)
+        self.size = dim * dim
+        self.blocked = [0] * self.size            # per cell: bitmask of closed directions
+        self.occupied = bytearray(3 * self.size)  # per wall code: is that wall on the board
 
         opponent_id = next(p.id for p in state.players if p.id != my_id)
         self.player_ids = (my_id, opponent_id)
@@ -219,28 +248,27 @@ class _Board:
             self.goals.append(players[pid].get_goal_row())
             self.walls_left.append(state.rep.remaining_walls.get(pid, 0))
 
-        self.h_walls: set[tuple[int, int]] = set()
-        self.v_walls: set[tuple[int, int]] = set()
         for wall in state.rep.walls:
-            self._place_wall_bits(wall.orientation == Orientation.HORIZONTAL, wall.row, wall.col)
+            if wall.orientation == Orientation.HORIZONTAL:
+                code = self.geo.h_code(wall.row, wall.col)
+            else:
+                code = self.geo.v_code(wall.row, wall.col)
+            if code >= 0:
+                self.place(code)
 
         self.turn = 0 if state.active_player.id == my_id else 1
         self.hash, self.hash_mirror = self._full_hashes()
 
-    # ------------------------------------------------------------------
     # Hashing
-    # ------------------------------------------------------------------
 
     def _full_hashes(self) -> tuple[int, int]:
-        """Hash of this position, and of its left-right mirror."""
+        """Hash of this position, and of its left-right mirror, from scratch."""
         z, geo = self.zobrist, self.geo
         value = mirrored = 0
-        for row, col in self.h_walls:
-            value ^= z.h_wall[row][col]
-            mirrored ^= z.h_wall[row][geo.mirror_h_col[col]]
-        for row, col in self.v_walls:
-            value ^= z.v_wall[row][col]
-            mirrored ^= z.v_wall[row][geo.mirror_v_col[col]]
+        for code in range(self.size, 3 * self.size):
+            if self.occupied[code]:
+                value ^= z.wall[code]
+                mirrored ^= z.wall_mirror[code]
         for player in (0, 1):
             value ^= z.pawn[player][self.pawns[player]]
             mirrored ^= z.pawn[player][geo.mirror_cell[self.pawns[player]]]
@@ -252,37 +280,43 @@ class _Board:
             mirrored ^= z.side
         return value, mirrored
 
-    def tt_key(self, depth: int) -> tuple[tuple, bool]:
-        """
-        Canonical transposition key: the smaller of the two hashes, so a
-        position and its mirror share one entry. The flag says whether the
-        mirrored form won, which tells the caller to mirror stored moves.
-        """
-        if self.hash_mirror < self.hash:
-            return (self.hash_mirror, depth), True
-        return (self.hash, depth), False
+    # Walls
 
-    # ------------------------------------------------------------------
-    # Wall bookkeeping
-    # ------------------------------------------------------------------
-
-    def _place_wall_bits(self, is_horizontal: bool, row: int, col: int) -> None:
-        edges = self.geo.h_edges if is_horizontal else self.geo.v_edges
+    def place(self, code: int) -> None:
+        """Put a wall on the board without touching turn, counters or hashes."""
         blocked = self.blocked
-        for cell, bit in edges[(row, col)]:
+        for cell, bit in self.geo.wall_edges[code]:
             blocked[cell] |= bit
-        (self.h_walls if is_horizontal else self.v_walls).add((row, col))
+        self.occupied[code] = 1
 
-    def _clear_wall_bits(self, is_horizontal: bool, row: int, col: int) -> None:
-        edges = self.geo.h_edges if is_horizontal else self.geo.v_edges
+    def remove(self, code: int) -> None:
         blocked = self.blocked
-        for cell, bit in edges[(row, col)]:
+        for cell, bit in self.geo.wall_edges[code]:
             blocked[cell] &= ~bit
-        (self.h_walls if is_horizontal else self.v_walls).discard((row, col))
+        self.occupied[code] = 0
 
-    # ------------------------------------------------------------------
+    def wall_fits(self, code: int) -> bool:
+        """Inside the board and neither overlapping nor crossing a wall already placed."""
+        if not self.geo.wall_valid[code]:
+            return False
+        occupied = self.occupied
+        for other in self.geo.wall_conflicts[code]:
+            if occupied[other]:
+                return False
+        return True
+
+    def wall_legal(self, code: int, placer: int | None = None) -> bool:
+        """Full legality, mirroring GameStateQuoridor._is_wall_legal exactly."""
+        if self.walls_left[self.turn if placer is None else placer] <= 0:
+            return False
+        if not self.wall_fits(code):
+            return False
+        self.place(code)
+        ok = self.has_path(0) and self.has_path(1)
+        self.remove(code)
+        return ok
+
     # Make / unmake
-    # ------------------------------------------------------------------
 
     def make_move(self, cell: int) -> int:
         player = self.turn
@@ -307,46 +341,38 @@ class _Board:
         self.hash_mirror ^= (z.pawn[player][mirror[cell]]
                              ^ z.pawn[player][mirror[previous]] ^ z.side)
 
-    def make_wall(self, is_horizontal: bool, row: int, col: int) -> None:
+    def make_wall(self, code: int) -> None:
         player = self.turn
-        self._place_wall_bits(is_horizontal, row, col)
+        self.place(code)
         left = self.walls_left[player]
         self.walls_left[player] = left - 1
         z = self.zobrist
-        table = z.h_wall if is_horizontal else z.v_wall
-        mirror_col = (self.geo.mirror_h_col if is_horizontal else self.geo.mirror_v_col)[col]
         shared = z.walls_left[player][left] ^ z.walls_left[player][left - 1] ^ z.side
-        self.hash ^= table[row][col] ^ shared
-        self.hash_mirror ^= table[row][mirror_col] ^ shared
+        self.hash ^= z.wall[code] ^ shared
+        self.hash_mirror ^= z.wall_mirror[code] ^ shared
         self.turn ^= 1
 
-    def unmake_wall(self, is_horizontal: bool, row: int, col: int) -> None:
+    def unmake_wall(self, code: int) -> None:
         self.turn ^= 1
         player = self.turn
-        self._clear_wall_bits(is_horizontal, row, col)
+        self.remove(code)
         left = self.walls_left[player]
         self.walls_left[player] = left + 1
         z = self.zobrist
-        table = z.h_wall if is_horizontal else z.v_wall
-        mirror_col = (self.geo.mirror_h_col if is_horizontal else self.geo.mirror_v_col)[col]
         shared = z.walls_left[player][left] ^ z.walls_left[player][left + 1] ^ z.side
-        self.hash ^= table[row][col] ^ shared
-        self.hash_mirror ^= table[row][mirror_col] ^ shared
+        self.hash ^= z.wall[code] ^ shared
+        self.hash_mirror ^= z.wall_mirror[code] ^ shared
 
-    # ------------------------------------------------------------------
-    # Pawn moves (mirrors GameStateQuoridor._try_direction, jumps included)
-    # ------------------------------------------------------------------
+    # Pawn moves (same rules as GameStateQuoridor._try_direction)
 
     def pawn_destinations(self, player: int) -> list[int]:
         destinations: list[int] = []
         other = self.pawns[1 - player]
         for direction in range(4):
             self._try_direction(self.pawns[player], direction, other, destinations)
-        seen = set()
         unique = []
         for cell in destinations:
-            if cell not in seen:
-                seen.add(cell)
+            if cell not in unique:
                 unique.append(cell)
         return unique
 
@@ -364,12 +390,10 @@ class _Board:
             return
         out.append(nxt)
 
-    # ------------------------------------------------------------------
-    # Path finding (ignores pawns, like the engine's _shortest_path)
-    # ------------------------------------------------------------------
+    # Path finding (pawns are ignored, like the engine's _shortest_path)
 
     def distance(self, player: int) -> int | None:
-        """A* with the admissible 'rows remaining' heuristic, bucket queue."""
+        """Shortest distance to the goal row (A* with a bucket queue), None if walled in."""
         start = self.pawns[player]
         goal_row = self.goals[player]
         row_of = self.geo.row_of
@@ -378,12 +402,11 @@ class _Board:
 
         neighbours = self.geo.neighbours
         blocked = self.blocked
-        size = self.dim * self.dim
+        size = self.size
 
         best = [-1] * size
         best[start] = 0
-        # f = cost + rows-to-goal; a winding path can cost up to size-1, so the
-        # queue must reach size-1 + (dim-1), not just a couple of board widths.
+        # f = cost + rows to goal, and a winding path can cost up to size - 1
         buckets: list[list[int]] = [[] for _ in range(size + self.dim)]
         buckets[abs(row_of[start] - goal_row)].append(start)
 
@@ -395,7 +418,7 @@ class _Board:
                 index += 1
                 cost = best[cell]
                 if cost + abs(row_of[cell] - goal_row) != f:
-                    continue  # stale entry, a cheaper path to this cell was found
+                    continue  # stale entry
                 if row_of[cell] == goal_row:
                     return cost
                 mask = blocked[cell]
@@ -413,7 +436,7 @@ class _Board:
         return None
 
     def has_path(self, player: int) -> bool:
-        """Reachability only, depth-first with early exit — cheaper than a full distance."""
+        """Reachability only, depth-first with early exit: cheaper than a full distance."""
         start = self.pawns[player]
         goal_row = self.goals[player]
         row_of = self.geo.row_of
@@ -422,7 +445,7 @@ class _Board:
 
         neighbours = self.geo.neighbours
         blocked = self.blocked
-        seen = bytearray(self.dim * self.dim)
+        seen = bytearray(self.size)
         seen[start] = 1
         stack = [start]
         while stack:
@@ -441,103 +464,16 @@ class _Board:
                 stack.append(nxt)
         return False
 
-    def mobility(self, player: int) -> int:
-        mask = self.blocked[self.pawns[player]]
-        row = self.geo.neighbours[self.pawns[player]]
-        return sum(1 for d in range(4) if row[d] >= 0 and not mask & (1 << d))
-
-    def worst_wall_damage(self, victim: int, placer: int, budget: int = MAX_DAMAGE_PROBES) -> int:
-        """
-        How many extra steps the single best wall by `placer` would cost `victim`.
-
-        This is the "can my path be cut?" question. Real games showed the agent
-        sprinting to within 2-3 steps of its goal along a single route and then
-        being sealed in, falling back 20+ steps. A seal takes several walls to
-        build, so it lies past any depth the search can reach — a horizon
-        effect, and the standard answer is to evaluate the threat statically.
-        """
-        if self.walls_left[placer] <= 0:
-            return 0
-        base = self.distance(victim)
-        if base is None:
-            return 0
-        path = self.shortest_path_cells(victim)
-        if len(path) < 2:
-            return 0
-
-        neighbours = self.geo.neighbours
-        blockers = self.geo.blockers
-        seen = set()
-        worst = 0
-        probes = 0
-
-        for cell, nxt in zip(path, path[1:]):
-            direction = -1
-            for d in range(4):
-                if neighbours[cell][d] == nxt:
-                    direction = d
-                    break
-            if direction < 0:
-                continue
-            for candidate in blockers[cell][direction]:
-                if candidate in seen:
-                    continue
-                seen.add(candidate)
-                if probes >= budget:
-                    return worst
-                is_horizontal, row, col = candidate
-                if not self.wall_legal(is_horizontal, row, col, placer):
-                    continue
-                probes += 1
-                self._place_wall_bits(is_horizontal, row, col)
-                after = self.distance(victim)
-                self._clear_wall_bits(is_horizontal, row, col)
-                if after is not None and after - base > worst:
-                    worst = after - base
-        return worst
-
-    # ------------------------------------------------------------------
-    # Wall legality (mirrors GameStateQuoridor._is_wall_legal exactly)
-    # ------------------------------------------------------------------
-
-    def wall_legal(self, is_horizontal: bool, row: int, col: int, placer: int | None = None) -> bool:
-        dim = self.dim
-        if self.walls_left[self.turn if placer is None else placer] <= 0:
-            return False
-        if not (0 <= row < dim and 0 <= col < dim):
-            return False
-
-        if is_horizontal:
-            if not 0 <= col < dim - 1:
-                return False
-            h = self.h_walls
-            if (row, col) in h or (row, col + 1) in h or (row, col - 1) in h:
-                return False
-            if (row - 1, col + 1) in self.v_walls:
-                return False
-        else:
-            if not 0 <= row < dim - 1:
-                return False
-            v = self.v_walls
-            if (row, col) in v or (row - 1, col) in v or (row + 1, col) in v:
-                return False
-            if (row + 1, col - 1) in self.h_walls:
-                return False
-
-        self._place_wall_bits(is_horizontal, row, col)
-        ok = self.has_path(0) and self.has_path(1)
-        self._clear_wall_bits(is_horizontal, row, col)
-        return ok
-
-    def shortest_path_cells(self, player: int) -> list[int]:
-        """Cells on one shortest path, used to pick wall candidates."""
+    def shortest_path(self, player: int) -> list[int]:
+        """Cells of one shortest path, pawn square first; empty if walled in."""
         start = self.pawns[player]
         goal_row = self.goals[player]
         row_of = self.geo.row_of
         neighbours = self.geo.neighbours
         blocked = self.blocked
 
-        parent = {start: -1}
+        parent = [-2] * self.size
+        parent[start] = -1
         queue = [start]
         index = 0
         while index < len(queue):
@@ -556,254 +492,420 @@ class _Board:
                 if mask & (1 << direction):
                     continue
                 nxt = row[direction]
-                if nxt >= 0 and nxt not in parent:
+                if nxt >= 0 and parent[nxt] == -2:
                     parent[nxt] = cell
                     queue.append(nxt)
         return []
 
-
-# A search action is a tuple: ("move", cell) or ("wall", is_horizontal, row, col).
+    def crossings(self, path: list[int]) -> set[int]:
+        """Crossing ids used by a path; a wall closing none of them cannot change the distance."""
+        direction = self.geo.direction
+        used = set()
+        for cell, nxt in zip(path, path[1:]):
+            d = direction[(cell, nxt)]
+            used.add(cell * 4 + d)
+            used.add(nxt * 4 + _OPPOSITE[d])
+        return used
 
 
 class MyPlayer(PlayerQuoridor):
-    """
-    Quoridor agent driven by iterative-deepening alpha-beta minimax.
+    """Quoridor agent: iterative-deepening principal-variation search on a fast mutable board."""
 
-    The search runs on `_Board`, a mutable bitmask representation with
-    make/unmake and incremental Zobrist hashing, rather than on the engine's
-    immutable states: allocating engine objects at every node capped the
-    search at depth 2-3.
-
-    Attributes:
-        piece_type (str): piece type of the player
-    """
+    # Test switches used by tools/test_search.py (class attributes, not in the game JSON)
+    _strict = False
+    _reductions = True
 
     def __init__(self, piece_type: str, goal_row: int = 0, name: str = "bob", *args, **kwargs) -> None:
-        """
-        Initialize the PlayerQuoridor instance.
-
-        Args:
-            piece_type (str): Type of the player's game piece
-            goal_row (int): The row the player wants to reach
-            name (str, optional): Name of the player (default is "bob")
-        """
+        """Create the player (piece type, goal row, name)."""
         super().__init__(piece_type, goal_row, name, *args, **kwargs)
-        # All underscore-prefixed, so none of this reaches the public game JSON.
-        self._tt = {}           # transposition table
-        self._recent = deque(maxlen=HISTORY_LENGTH)  # my own recent pawn squares
-        self._last_step = None  # to detect a new game on a reused instance
+        # Underscore-prefixed so nothing here is written to the game JSON
+        self._tt = {}            # transposition table: key -> (depth, value, flag, best move)
+        self._history = []       # cut-off counts per move
+        self._killers = []       # two killer moves per ply
+        self._recent = deque(maxlen=HISTORY_LENGTH)  # my recent pawn squares
+        self._last_step = None   # detects a new game on a reused instance
+        self._deadline = 0.0
+        self._nodes = 0
+        self._next_clock_check = 0
+        self._partial = None     # best root move of an unfinished pass
+        self._reached_depth = 0  # last completed depth
 
-    # ------------------------------------------------------------------
     # Entry point
-    # ------------------------------------------------------------------
 
     def compute_action(self, current_state: GameStateQuoridor, remaining_time: float = 15 * 60, **kwargs) -> Action:
-        """
-        Choose the best action found by iterative-deepening alpha-beta search
-        within the time budget allocated for this move.
-
-        Args:
-            current_state (GameStateQuoridor): The current game state.
-            remaining_time (float): Time left, in seconds, for the rest of the whole game.
-
-        Returns:
-            Action: The selected legal action.
-        """
-        # The clock starts here, not after the setup below: everything this
-        # method does counts against the move's budget.
+        """Return the best action found by iterative deepening within this move's time budget."""
+        # The clock starts here: the setup below counts against the budget too
         start = time.perf_counter()
 
         self._record_position(current_state)
         board = _Board(current_state, current_state.active_player.id)
-        deadline = start + self._time_budget(board, remaining_time, current_state.get_step())
+        budget = self._time_budget(board, remaining_time, current_state.get_step())
 
-        actions = self._candidate_actions(board)
-        if not actions:
+        moves = self._root_moves(board)
+        if not moves:
             return self._engine_fallback(current_state)
-        if len(actions) == 1:
-            return self._to_engine_action(actions[0], current_state)
+        if len(moves) == 1:
+            return self._to_engine_action(board, moves[0], current_state)
 
-        # Cheap guaranteed fallback. Depth 1 of the search below refines it
-        # almost immediately, so it only has to be legal and sane, not good.
-        best_action = self._fallback_action(board, actions)
+        best_move = self._search(board, moves, start, budget)
+        return self._to_engine_action(board, best_move, current_state)
 
-        depth = 1
+    def _search(self, board: _Board, moves: list[int], start: float, budget: float,
+                max_depth: int = MAX_DEPTH) -> int:
+        """Iterative deepening over `moves`; returns the best move found in time."""
+        self._deadline = start + budget
+        self._nodes = 0
+        self._next_clock_check = 0
+        self._reached_depth = 0
+        self._killers = [[-1, -1] for _ in range(MAX_DEPTH + 2)]
+        if len(self._history) != 3 * board.size:
+            self._history = [0] * (3 * board.size)
+        else:
+            # Age rather than reset: last move's refutations are still a good guess.
+            self._history = [h >> 2 for h in self._history]
+
+        # Legal fallback in case even depth 1 does not finish
+        best_move = self._fallback_move(board, moves)
+        moves = [best_move] + [m for m in moves if m != best_move]
+
         try:
-            while depth <= MAX_DEPTH:
-                action, _ = self._search_root(board, actions, depth, deadline)
-                if action is not None:
-                    best_action = action
-                depth += 1
+            for depth in range(1, max_depth + 1):
+                best_move, value = self._search_root(board, moves, depth)
+                self._reached_depth = depth
+                # The proven best move goes first in the next, deeper pass.
+                moves = [best_move] + [m for m in moves if m != best_move]
+                if abs(value) >= WIN_SCORE:
+                    break  # forced win or loss
+                if time.perf_counter() - start > budget * NEXT_DEPTH_FRACTION:
+                    break
         except _TimeUp:
-            pass
-
-        return self._to_engine_action(best_action, current_state)
+            # The unfinished pass searched the old best move first, so its best move is still valid
+            if self._partial is not None:
+                best_move = self._partial
+        return best_move
 
     def _time_budget(self, board: _Board, remaining_time: float, step: int = 0) -> float:
-        """
-        Share of the whole-game budget granted to this move.
-
-        Estimated from my own remaining turns (at best one row per turn, plus
-        the turns spent placing walls). Three caps keep a single move from
-        ever claiming an absurd slice: an absolute ceiling, a fraction of what
-        is left, and a floor under the remaining-move estimate. Without them
-        an endgame estimate of "4 moves left" granted 225s for one move.
-
-        The opening gets a much smaller slice. Real tournament games showed 19
-        consecutive opening moves pinned at the old 30s ceiling, 570s of the
-        900s budget, once leaving only 59s for the rest of the game — and the
-        opening is where extra depth is provably worth least, since both pawns
-        simply advance. An opponent beat us using 3.7s a move.
-        """
+        """Time granted to this move: remaining time over estimated moves left, with caps."""
         if remaining_time <= SAFETY_MARGIN:
             return 0.0
+        usable = remaining_time - SAFETY_MARGIN
+
+        if board.walls_left[0] == 0 and board.walls_left[1] == 0:
+            ceiling = RACE_BUDGET
+        elif step < QUIET_OPENING_PLIES and not any(board.occupied):
+            ceiling = QUIET_OPENING_BUDGET
+        else:
+            ceiling = MAX_MOVE_BUDGET
 
         my_distance = board.distance(board.turn) or 0
-        my_walls = board.walls_left[board.turn]
-        moves_left_estimate = max(MIN_MOVES_LEFT, my_distance + my_walls)
-
-        usable = remaining_time - SAFETY_MARGIN
-        ceiling = OPENING_BUDGET if step < OPENING_PLIES else MAX_MOVE_BUDGET
+        moves_left_estimate = max(MIN_MOVES_LEFT, my_distance + board.walls_left[board.turn])
         budget = min(usable / moves_left_estimate, ceiling, usable * MAX_BUDGET_FRACTION)
         return max(min(MIN_BUDGET, usable), budget)
 
-    # ------------------------------------------------------------------
     # Search
-    # ------------------------------------------------------------------
 
-    def _search_root(
-        self,
-        board: _Board,
-        actions: list[tuple],
-        depth: int,
-        deadline: float,
-    ) -> tuple[tuple | None, float]:
-        """
-        One full iterative-deepening pass: explores every candidate action at
-        the root and returns the best one found, or raises `_TimeUp` if the
-        budget runs out before every root action has been explored (the
-        partial result is then discarded by the caller).
-        """
-        tt_key, mirrored = board.tt_key(depth)
-        cached = self._tt.get(tt_key)
-        hint = self._mirror_action(board, cached[2]) if (cached and mirrored) else (cached[2] if cached else None)
-        actions = self._order_actions(board, actions, hint)
+    def _search_root(self, board: _Board, moves: list[int], depth: int) -> tuple[int, int]:
+        """One deepening pass over the root moves; the repetition penalty is applied only here."""
+        self._partial = None
+        path_me = board.shortest_path(0)
+        path_op = board.shortest_path(1)
+        info = (len(path_me) - 1, len(path_op) - 1, path_me,
+                board.crossings(path_me), board.crossings(path_op))
 
-        alpha, beta = -inf, inf
-        best_action = None
-        best_value = -inf
+        best_move = moves[0]
+        best_adjusted = -INFINITY
+        best_value = -INFINITY
+        for index, move in enumerate(moves):
+            cost = self._repetition_cost(board, move)
+            if index == 0:
+                value = self._search_child(board, move, depth, -INFINITY, INFINITY, info, 0)
+            else:
+                threshold = best_adjusted + cost
+                value = self._search_child(board, move, depth, threshold, threshold + 1, info, 0)
+                if value is not None and value > threshold:
+                    value = self._search_child(board, move, depth, threshold, INFINITY, info, 0)
+            if value is None:
+                continue
+            if value - cost > best_adjusted:
+                best_adjusted = value - cost
+                best_value = value
+                best_move = move
+            # Usable if time runs out: the first move was the previous pass's choice
+            self._partial = best_move
+        return best_move, best_value
 
-        for action in actions:
-            undo = self._make(board, action)
-            value = self._alphabeta(board, depth - 1, alpha, beta, False, deadline)
-            self._unmake(board, action, undo)
+    def _search_child(self, board: _Board, move: int, depth: int, alpha: int, beta: int,
+                      info: tuple, ply: int) -> int | None:
+        """Play `move`, search below it, undo it; None means the move was an illegal wall."""
+        d_me, d_op, path_me, cross_me, cross_op = info
+        mover = board.turn
 
-            # The repetition penalty is applied only here, to pick between root
-            # moves. Alpha still tracks the raw value, so pruning stays sound
-            # and the penalty never leaks into the search tree's evaluations.
-            adjusted = value - self._repetition_cost(board, action)
-            if adjusted > best_value:
-                best_value = adjusted
-                best_action = action
-            alpha = max(alpha, value)
+        if move < board.size:
+            previous = board.make_move(move)
+            if depth == 1:
+                # The child is a leaf: only the mover's distance changed, by -1 along its shortest path
+                if len(path_me) > 1 and move == path_me[1]:
+                    d_me -= 1
+                else:
+                    d_me = board.distance(mover)
+            value = -self._negamax(board, depth - 1, -beta, -alpha, d_op, d_me, ply + 1)
+            board.unmake_move(previous)
+            return value
 
-        # Root search always uses the full (-inf, inf) window, so a completed
-        # pass never fails high/low: the value is always exact here.
-        if best_action is not None:
-            stored = self._mirror_action(board, best_action) if mirrored else best_action
-            self._store_tt(tt_key, best_value, "EXACT", stored)
+        cuts = board.geo.wall_cuts[move]
+        cuts_op = not cuts.isdisjoint(cross_op)
+        cuts_me = not cuts.isdisjoint(cross_me)
+        board.make_wall(move)
+        # Only a player whose shortest path is cut needs a new path search (also settles legality)
+        if depth == 1:
+            if cuts_op:
+                d_op = board.distance(1 - mover)
+            if cuts_me and d_op is not None:
+                d_me = board.distance(mover)
+            legal = d_op is not None and d_me is not None
+        else:
+            legal = ((not cuts_op or board.has_path(1 - mover))
+                     and (not cuts_me or board.has_path(mover)))
+        value = None
+        if legal:
+            value = -self._negamax(board, depth - 1, -beta, -alpha, d_op, d_me, ply + 1)
+        board.unmake_wall(move)
+        return value
 
-        return best_action, best_value
+    def _negamax(self, board: _Board, depth: int, alpha: int, beta: int,
+                 d_me: int, d_op: int, ply: int) -> int:
+        """Negamax value for the side to move; d_me and d_op are only read at depth 0."""
+        self._nodes += 1
+        if self._nodes >= self._next_clock_check:
+            self._next_clock_check = self._nodes + CLOCK_CHECK_INTERVAL
+            if time.perf_counter() >= self._deadline:
+                raise _TimeUp()
 
-    def _alphabeta(
-        self,
-        board: _Board,
-        depth: int,
-        alpha: float,
-        beta: float,
-        maximizing: bool,
-        deadline: float,
-    ) -> float:
-        """
-        Standard alpha-beta minimax, bounded by `deadline` (checked at every
-        node) and using a depth-keyed transposition table to reuse work
-        across the transpositions that iterative deepening naturally revisits.
-        """
-        if time.perf_counter() >= deadline:
-            raise _TimeUp()
+        turn = board.turn
+        other = 1 - turn
+        geo = board.geo
+        # Only the player who has just moved can be standing on its goal row.
+        if geo.row_of[board.pawns[other]] == board.goals[other]:
+            return -(WIN_SCORE + depth)
+        if depth <= 0:
+            return (W_DISTANCE * (d_op - d_me)
+                    + W_WALLS * (board.walls_left[turn] - board.walls_left[other]) + TEMPO)
 
-        row_of = board.geo.row_of
-        if row_of[board.pawns[0]] == board.goals[0]:
-            return WIN_SCORE + depth
-        if row_of[board.pawns[1]] == board.goals[1]:
-            return -WIN_SCORE - depth
-        if depth == 0:
-            return self._evaluate(board)
+        # Transposition table
+        strict = self._strict
+        mirrored = not strict and board.hash_mirror < board.hash
+        key = board.hash_mirror if mirrored else board.hash
+        entry = self._tt.get(key)
+        tt_move = -1
+        if entry is not None:
+            e_depth, e_value, e_flag, tt_move = entry
+            if mirrored and tt_move >= 0:
+                tt_move = geo.mirror_move[tt_move]
+            # A win/loss score counts plies from the pass that found it: reuse it at the same depth only
+            if e_depth == depth or (e_depth > depth and not strict and abs(e_value) < WIN_SCORE):
+                if e_flag == EXACT:
+                    return e_value
+                if e_flag == LOWER:
+                    if e_value >= beta:
+                        return e_value
+                elif e_value <= alpha:
+                    return e_value
 
-        alpha_orig, beta_orig = alpha, beta
-        tt_key, mirrored = board.tt_key(depth)
-        cached = self._tt.get(tt_key)
-        tt_move = None
+        # Paths and move ordering
+        path_me = board.shortest_path(turn)
+        path_op = board.shortest_path(other)
+        d_me, d_op = len(path_me) - 1, len(path_op) - 1
+        cross_me, cross_op = board.crossings(path_me), board.crossings(path_op)
+        info = (d_me, d_op, path_me, cross_me, cross_op)
 
-        if cached is not None:
-            cached_value, cached_flag, tt_move = cached
-            if mirrored and tt_move is not None:
-                tt_move = self._mirror_action(board, tt_move)
-            if cached_flag == "EXACT":
-                return cached_value
-            if cached_flag == "LOWERBOUND":
-                alpha = max(alpha, cached_value)
-            elif cached_flag == "UPPERBOUND":
-                beta = min(beta, cached_value)
-            if alpha >= beta:
-                return cached_value
+        ordered = self._ordered_moves(board, depth, ply, tt_move, info, path_op)
 
-        actions = self._order_actions(board, self._candidate_actions(board), tt_move)
+        alpha_start = alpha
+        best_value = -INFINITY
+        best_move = -1
+        searched = 0
+        size = board.size
 
-        best_value = -inf if maximizing else inf
-        best_action = None
-
-        for action in actions:
-            undo = self._make(board, action)
-            value = self._alphabeta(board, depth - 1, alpha, beta, not maximizing, deadline)
-            self._unmake(board, action, undo)
-
-            if maximizing:
+        if depth == 1:
+            # Frontier: children are leaves, scored here without playing the move
+            walls_term = W_WALLS * (board.walls_left[turn] - board.walls_left[other])
+            forward = path_me[1] if d_me > 0 else -1
+            goal_row = board.goals[turn]
+            row_of = geo.row_of
+            wall_cuts = geo.wall_cuts
+            pawns = board.pawns
+            here = pawns[turn]
+            for move in ordered:
+                if move < size:
+                    if row_of[move] == goal_row:
+                        value = WIN_SCORE
+                    else:
+                        if move == forward:
+                            after_me = d_me - 1
+                        else:
+                            pawns[turn] = move
+                            after_me = board.distance(turn)
+                            pawns[turn] = here
+                        value = W_DISTANCE * (d_op - after_me) + walls_term - TEMPO
+                else:
+                    cuts = wall_cuts[move]
+                    after_op, after_me = d_op, d_me
+                    cuts_op = not cuts.isdisjoint(cross_op)
+                    cuts_me = not cuts.isdisjoint(cross_me)
+                    if cuts_op or cuts_me:
+                        board.place(move)
+                        if cuts_op:
+                            after_op = board.distance(other)
+                        if cuts_me and after_op is not None:
+                            after_me = board.distance(turn)
+                        board.remove(move)
+                        if after_op is None or after_me is None:
+                            continue  # illegal wall
+                    value = W_DISTANCE * (after_op - after_me) + walls_term - W_WALLS - TEMPO
+                self._nodes += 1
+                searched += 1
                 if value > best_value:
                     best_value = value
-                    best_action = action
-                alpha = max(alpha, value)
-            else:
-                if value < best_value:
-                    best_value = value
-                    best_action = action
-                beta = min(beta, value)
-
-            if alpha >= beta:
-                break
-
-        # A cutoff means best_value only bounds the true value, not equals it:
-        # fail-high (>= beta_orig) gives a lower bound, fail-low (<= alpha_orig)
-        # an upper bound. Only a value that stayed strictly inside the original
-        # window is exact.
-        if best_value <= alpha_orig:
-            flag = "UPPERBOUND"
-        elif best_value >= beta_orig:
-            flag = "LOWERBOUND"
+                    best_move = move
+                    if value > alpha:
+                        alpha = value
+                        if alpha >= beta:
+                            self._record_cutoff(move, depth, ply)
+                            break
         else:
-            flag = "EXACT"
+            # Principal-variation search
+            reduce_from = LMR_FULL_MOVES if (self._reductions and depth >= LMR_MIN_DEPTH) else 1 << 30
+            for move in ordered:
+                if searched == 0:
+                    value = self._search_child(board, move, depth, alpha, beta, info, ply)
+                else:
+                    # Null window for later moves, late walls one ply less; re-search on success
+                    reduced = searched >= reduce_from and move >= size
+                    value = self._search_child(board, move, depth - 1 if reduced else depth,
+                                               alpha, alpha + 1, info, ply)
+                    if value is not None and value > alpha and reduced:
+                        value = self._search_child(board, move, depth, alpha, alpha + 1, info, ply)
+                    if value is not None and alpha < value < beta:
+                        value = self._search_child(board, move, depth, alpha, beta, info, ply)
+                if value is None:
+                    continue  # illegal wall
+                searched += 1
+                if value > best_value:
+                    best_value = value
+                    best_move = move
+                    if value > alpha:
+                        alpha = value
+                        if alpha >= beta:
+                            self._record_cutoff(move, depth, ply)
+                            break
 
-        if mirrored and best_action is not None:
-            best_action = self._mirror_action(board, best_action)
-        self._store_tt(tt_key, best_value, flag, best_action)
+        if searched == 0:
+            # No legal action (pawn boxed in by the other pawn): static score
+            return (W_DISTANCE * (d_op - d_me)
+                    + W_WALLS * (board.walls_left[turn] - board.walls_left[other]) + TEMPO)
+
+        # <= old alpha: upper bound, >= beta: lower bound, otherwise exact
+        if best_value <= alpha_start:
+            flag = UPPER
+        elif best_value >= beta:
+            flag = LOWER
+        else:
+            flag = EXACT
+        if len(self._tt) >= MAX_TT_ENTRIES:
+            self._tt.clear()
+        self._tt[key] = (depth, best_value, flag,
+                         geo.mirror_move[best_move] if mirrored else best_move)
         return best_value
 
+    def _record_cutoff(self, move: int, depth: int, ply: int) -> None:
+        """Record a move that caused a cut-off (killer and history tables)."""
+        killers = self._killers[ply]
+        if killers[0] != move:
+            killers[1] = killers[0]
+            killers[0] = move
+        history = self._history
+        history[move] += depth * depth
+        if history[move] > HISTORY_MAX:
+            for index in range(len(history)):
+                history[index] >>= 1
+
+    # Move generation and ordering
+
+    def _wall_candidates(self, board: _Board, path_me: list[int], path_op: list[int]) -> list[int]:
+        """Wall slots touching either shortest path (path existence is checked later)."""
+        if board.walls_left[board.turn] <= 0:
+            return []
+        blockers = board.geo.blockers
+        direction = board.geo.direction
+        seen = set()
+        walls = []
+        for path in (path_op, path_me):
+            for cell, nxt in zip(path, path[1:]):
+                for code in blockers[cell][direction[(cell, nxt)]]:
+                    if code not in seen:
+                        seen.add(code)
+                        if board.wall_fits(code):
+                            walls.append(code)
+                            if len(walls) >= MAX_WALL_CANDIDATES:
+                                return walls
+        return walls
+
+    def _ordered_moves(self, board: _Board, depth: int, ply: int, tt_move: int,
+                       info: tuple, path_op: list[int]) -> list[int]:
+        """Moves to try, best first: table move, forward step, walls, then other pawn moves."""
+        d_me, d_op, path_me, cross_me, cross_op = info
+        turn = board.turn
+        pawn_moves = board.pawn_destinations(turn)
+        walls = self._wall_candidates(board, path_me, path_op)
+
+        history = self._history
+        killers = self._killers[ply]
+        if depth >= GAIN_ORDER_MIN_DEPTH and walls:
+            # Measure each wall's effect on both distances; illegal walls drop out here
+            wall_cuts = board.geo.wall_cuts
+            scored = []
+            for code in walls:
+                cuts = wall_cuts[code]
+                after_op, after_me = d_op, d_me
+                board.place(code)
+                if not cuts.isdisjoint(cross_op):
+                    after_op = board.distance(1 - turn)
+                if after_op is not None and not cuts.isdisjoint(cross_me):
+                    after_me = board.distance(turn)
+                board.remove(code)
+                if after_op is None or after_me is None:
+                    continue  # illegal wall
+                gain = (after_op - d_op) - (after_me - d_me)
+                bonus = 2 if code == killers[0] else 1 if code == killers[1] else 0
+                scored.append((gain * 4 + bonus, history[code], code))
+            scored.sort(reverse=True)
+            walls = [code for _, _, code in scored]
+        elif walls:
+            walls.sort(key=lambda code: (code == killers[0] or code == killers[1], history[code]),
+                       reverse=True)
+
+        forward = path_me[1] if len(path_me) > 1 else -1
+        ordered = []
+        if tt_move >= 0 and (tt_move in pawn_moves or tt_move in walls):
+            ordered.append(tt_move)
+        if forward in pawn_moves and forward != tt_move:
+            ordered.append(forward)
+        ordered.extend(code for code in walls if code != tt_move)
+        ordered.extend(cell for cell in pawn_moves if cell != tt_move and cell != forward)
+        return ordered
+
+    def _root_moves(self, board: _Board) -> list[int]:
+        """Every legal move considered at the root: pawn moves, then legal wall candidates."""
+        path_me = board.shortest_path(0)
+        path_op = board.shortest_path(1)
+        walls = [code for code in self._wall_candidates(board, path_me, path_op)
+                 if board.wall_legal(code)]
+        return board.pawn_destinations(0) + walls
+
+    # Repetition
+
     def _record_position(self, state: GameStateQuoridor) -> None:
-        """
-        Remember where my pawn has just been, so the root can refuse to walk
-        back onto it. Clears when the step counter goes backwards, which means
-        a new game started on a reused player instance.
-        """
+        """Remember my recent squares; reset when a new game starts on the same instance."""
         step = state.get_step()
         if self._last_step is not None and step < self._last_step:
             self._recent.clear()
@@ -814,177 +916,45 @@ class MyPlayer(PlayerQuoridor):
         if not self._recent or self._recent[-1] != position:
             self._recent.append(position)
 
-    def _repetition_cost(self, board: _Board, action: tuple) -> float:
+    def _repetition_cost(self, board: _Board, move: int) -> int:
         """Cost of returning to a recently occupied square; the more recent, the worse."""
-        if action[0] != "move" or not self._recent:
-            return 0.0
-        destination = (action[1] // board.dim, action[1] % board.dim)
-        # _recent[-1] is the square I am standing on, which no move can target,
-        # so age starts at 1: the square I just came from carries the full cost.
+        if move >= board.size or not self._recent:
+            return 0
+        destination = (move // board.dim, move % board.dim)
+        # _recent[-1] is my current square, so age starts at 1
         for age, position in enumerate(reversed(self._recent)):
             if age and position == destination:
                 overtime = max(0, (self._last_step or 0) - STALL_PLIES)
-                return (W_REPETITION / age) * (1.0 + overtime / STALL_GROWTH)
-        return 0.0
+                return int((W_REPETITION / age) * (1.0 + overtime / STALL_GROWTH))
+        return 0
 
-    @staticmethod
-    def _mirror_action(board: _Board, action: tuple | None) -> tuple | None:
-        """Same action seen in the mirrored frame, so a move hint stored under
-        the canonical key still names a real move in this position."""
-        if action is None:
-            return None
-        if action[0] == "move":
-            return ("move", board.geo.mirror_cell[action[1]])
-        is_horizontal, row, col = action[1], action[2], action[3]
-        table = board.geo.mirror_h_col if is_horizontal else board.geo.mirror_v_col
-        return ("wall", is_horizontal, row, table[col])
-
-    def _store_tt(self, key: tuple, value: float, flag: str, action: tuple | None) -> None:
-        if len(self._tt) >= MAX_TT_ENTRIES:
-            self._tt.clear()
-        self._tt[key] = (value, flag, action)
-
-    @staticmethod
-    def _make(board: _Board, action: tuple):
-        if action[0] == "move":
-            return board.make_move(action[1])
-        board.make_wall(action[1], action[2], action[3])
-        return None
-
-    @staticmethod
-    def _unmake(board: _Board, action: tuple, undo) -> None:
-        if action[0] == "move":
-            board.unmake_move(undo)
-        else:
-            board.unmake_wall(action[1], action[2], action[3])
-
-    # ------------------------------------------------------------------
-    # Action generation
-    # ------------------------------------------------------------------
-
-    def _candidate_actions(self, board: _Board) -> list[tuple]:
-        """
-        Keeps every pawn move, and only the walls that touch the opponent's
-        or our own current shortest path.
-
-        Testing all ~128 wall slots at every node would collapse the
-        achievable depth; walls that touch neither shortest path cannot
-        change either player's distance this ply anyway.
-        """
-        player = board.turn
-        actions: list[tuple] = [("move", cell) for cell in board.pawn_destinations(player)]
-        if board.walls_left[player] <= 0:
-            return actions
-
-        blockers = board.geo.blockers
-        neighbours = board.geo.neighbours
-        seen = set()
-        walls = []
-
-        for who in (1 - player, player):
-            path = board.shortest_path_cells(who)
-            for cell, nxt in zip(path, path[1:]):
-                direction = next(d for d in range(4) if neighbours[cell][d] == nxt)
-                for candidate in blockers[cell][direction]:
-                    if candidate in seen:
-                        continue
-                    seen.add(candidate)
-                    if board.wall_legal(candidate[0], candidate[1], candidate[2]):
-                        walls.append(("wall", candidate[0], candidate[1], candidate[2]))
-
-        return actions + walls[:MAX_WALL_CANDIDATES]
-
-    def _order_actions(self, board: _Board, actions: list[tuple], tt_move: tuple | None) -> list[tuple]:
-        """
-        Cheap move ordering to improve alpha-beta cutoffs: the transposition
-        table's best move first, then pawn moves by how much closer they get
-        to the goal row, then walls in the order `_candidate_actions` found
-        them (opponent-blocking walls before path-protecting ones).
-        """
-        row_of = board.geo.row_of
-        goal_row = board.goals[board.turn]
-        current_row = row_of[board.pawns[board.turn]]
-
-        def score(action: tuple) -> float:
-            if tt_move is not None and action == tt_move:
-                return 1_000.0
-            if action[0] == "move":
-                return 10.0 + (abs(current_row - goal_row) - abs(row_of[action[1]] - goal_row))
-            return 0.0
-
-        return sorted(actions, key=score, reverse=True)
-
-    # ------------------------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------------------------
-
-    def _evaluate(self, board: _Board) -> float:
-        """Higher is better for player 0, who is always the side we play."""
-        my_distance = board.distance(0)
-        opponent_distance = board.distance(1)
-
-        if my_distance is None:
-            return -NO_PATH_SCORE
-        if opponent_distance is None:
-            return NO_PATH_SCORE
-
-        score = (
-            W_DISTANCE * (opponent_distance - my_distance)
-            + W_WALLS * (board.walls_left[0] - board.walls_left[1])
-            + W_MOBILITY * (board.mobility(0) - board.mobility(1))
-        )
-
-        # Being three steps from the goal on a route the opponent can cut is
-        # worth far less than it looks. Only assessed near the goal: that is
-        # where a seal is fatal, and it keeps this costly term off most leaves.
-        if my_distance <= VULNERABILITY_RANGE:
-            score -= W_VULNERABILITY * board.worst_wall_damage(0, 1)
-        if opponent_distance <= VULNERABILITY_RANGE:
-            score += W_VULNERABILITY * board.worst_wall_damage(1, 0)
-
-        return score
-
-    def _fallback_action(self, board: _Board, actions: list[tuple]) -> tuple:
-        """
-        The pawn move that gets closest to the goal, or any legal action if
-        none advances. Only a handful of path computations, so it still
-        completes when the budget is nearly zero.
-        """
-        best_action = actions[0]
-        best_distance = inf
-
-        for action in actions:
-            if action[0] != "move":
+    def _fallback_move(self, board: _Board, moves: list[int]) -> int:
+        """Pawn move that gets closest to the goal, used when there is no time to search."""
+        best_move = moves[0]
+        best_distance = INFINITY
+        for move in moves:
+            if move >= board.size:
                 continue
-            undo = board.make_move(action[1])
+            previous = board.make_move(move)
             distance = board.distance(0)
-            board.unmake_move(undo)
+            board.unmake_move(previous)
             if distance is not None and distance < best_distance:
                 best_distance = distance
-                best_action = action
+                best_move = move
+        return best_move
 
-        return best_action
+    # Conversion to engine actions
 
-    # ------------------------------------------------------------------
-    # Conversion back to engine actions
-    # ------------------------------------------------------------------
-
-    def _to_engine_action(self, action: tuple, state: GameStateQuoridor) -> Action:
-        """
-        Build the engine action, and verify it against the engine's own rules.
-
-        The search runs on a reimplementation of the game rules, so a single
-        divergence would mean an illegal action and an instant loss. This
-        check costs one legality call per turn, against the ~270ms it would
-        take to enumerate every legal action.
-        """
-        dimension = state.rep.dimension
-        if action[0] == "move":
-            destination = (action[1] // dimension, action[1] % dimension)
+    def _to_engine_action(self, board: _Board, move: int, state: GameStateQuoridor) -> Action:
+        """Build the engine action and check it against the engine's rules (an illegal action loses)."""
+        dim, size = board.dim, board.size
+        if move < size:
+            destination = (move // dim, move % dim)
             if any(a.data["destination"] == destination for a in state._legal_moves()):
                 return StatelessAction({"type": "move", "destination": destination})
         else:
-            is_horizontal, row, col = action[1], action[2], action[3]
+            is_horizontal = move < 2 * size
+            row, col = divmod(move % size, dim)
             orientation = Orientation.HORIZONTAL if is_horizontal else Orientation.VERTICAL
             if state._is_wall_legal(Wall(row, col, orientation)):
                 return StatelessAction({
