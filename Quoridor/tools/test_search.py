@@ -11,9 +11,9 @@ as `reference()` below -- a negamax with no pruning, no table, every wall
 checked up front and every distance recomputed from scratch.
 
 Late-move reductions are the one deliberate exception (they trade exactness
-for depth), so they are switched off here, along with table reuse across
-depths and across mirror positions, through `MyPlayer._strict` and
-`MyPlayer._reductions`.
+for depth), so they are switched off here by raising `LMR_MIN_DEPTH`; table
+reuse across depths and across mirror positions is switched off through
+`MyPlayer._strict`.
 
 RUN THIS AFTER ANY CHANGE TO THE SEARCH. A wrong sign or a wrong bound does
 not crash: it just plays slightly worse, and no match is long enough to show it.
@@ -93,7 +93,7 @@ def sample_positions(count: int, seed: int, wall_bias: float = 0.35):
 
 def main(positions: int, max_depth: int) -> None:
     MyPlayer._strict = True
-    MyPlayer._reductions = False
+    my_player.LMR_MIN_DEPTH = 99  # no late-move reductions
     my_player.GAIN_ORDER_MIN_DEPTH = 2  # so the gain-ordered branch is exercised at these depths
 
     failures = 0

@@ -7,6 +7,7 @@ from __future__ import annotations
 import random
 import time
 from collections import deque
+from functools import lru_cache
 
 from actions_quoridor import Orientation, Wall
 from game_state_quoridor import GameStateQuoridor
@@ -68,8 +69,6 @@ _OPPOSITE_AXIS = ((WEST, EAST), (WEST, EAST), (NORTH, SOUTH), (NORTH, SOUTH))
 class _Geometry:
     """Board tables that only depend on the dimension, built once and shared."""
 
-    _cache: dict[int, "_Geometry"] = {}
-
     def __init__(self, dim: int) -> None:
         self.dim = dim
         size = self.size = dim * dim
@@ -99,8 +98,12 @@ class _Geometry:
                 # Same bounds as GameStateQuoridor._is_wall_legal
                 self.wall_valid[h_code] = col < dim - 1
                 self.wall_valid[v_code] = row < dim - 1
-                for code, edges in ((h_code, self._horizontal_edges(row, col)),
-                                    (v_code, self._vertical_edges(row, col))):
+                # A wall closes two crossings, each in both directions: under it (H) or beside it (V)
+                h_edges = [edge for c in (col, col + 1) if row >= 1 and c < dim
+                           for edge in (((row - 1) * dim + c, SOUTH), (row * dim + c, NORTH))]
+                v_edges = [edge for r in (row, row + 1) if col >= 1 and r < dim
+                           for edge in ((r * dim + col - 1, EAST), (r * dim + col, WEST))]
+                for code, edges in ((h_code, h_edges), (v_code, v_edges)):
                     self.wall_edges[code] = tuple((cell, 1 << d) for cell, d in edges)
                     self.wall_cuts[code] = frozenset(cell * 4 + d for cell, d in edges)
                 self.wall_conflicts[h_code] = tuple(
@@ -111,25 +114,9 @@ class _Geometry:
                                       self.h_code(row + 1, col - 1)) if code >= 0)
 
         # Walls that can close a given crossing (same as _candidate_blocking_walls)
-        self.blockers: list[list[tuple]] = [[() for _ in range(4)] for _ in range(size)]
-        for row in range(dim):
-            for col in range(dim):
-                cell = row * dim + col
-                south, north, east, west = [], [], [], []
-                if col > 0:
-                    south.append(self.h_code(row + 1, col - 1))
-                    north.append(self.h_code(row, col - 1))
-                if col < dim - 1:
-                    south.append(self.h_code(row + 1, col))
-                    north.append(self.h_code(row, col))
-                if row > 0:
-                    east.append(self.v_code(row - 1, col + 1))
-                    west.append(self.v_code(row - 1, col))
-                if row < dim - 1:
-                    east.append(self.v_code(row, col + 1))
-                    west.append(self.v_code(row, col))
-                for direction, codes in ((SOUTH, south), (NORTH, north), (EAST, east), (WEST, west)):
-                    self.blockers[cell][direction] = tuple(c for c in codes if c >= 0)
+        self.blockers = [[tuple(code for code in range(size, 3 * size)
+                                if self.wall_valid[code] and cell * 4 + d in self.wall_cuts[code])
+                          for d in range(4)] for cell in range(size)]
 
         # Left-right mirror: horizontal walls map c -> dim-2-c, vertical walls c -> dim-c
         self.mirror_cell = [row * dim + (dim - 1 - col) for row in range(dim) for col in range(dim)]
@@ -152,41 +139,9 @@ class _Geometry:
         dim = self.dim
         return 2 * self.size + row * dim + col if 0 <= row < dim and 0 <= col < dim else -1
 
-    def _horizontal_edges(self, row: int, col: int) -> list[tuple[int, int]]:
-        """A horizontal wall at (row, col) closes the two north-south crossings beneath it."""
-        dim = self.dim
-        edges = []
-        if 1 <= row < dim:
-            for c in (col, col + 1):
-                if 0 <= c < dim:
-                    edges.append(((row - 1) * dim + c, SOUTH))
-                    edges.append((row * dim + c, NORTH))
-        return edges
-
-    def _vertical_edges(self, row: int, col: int) -> list[tuple[int, int]]:
-        """A vertical wall at (row, col) closes the two east-west crossings beside it."""
-        dim = self.dim
-        edges = []
-        if 1 <= col < dim:
-            for r in (row, row + 1):
-                if 0 <= r < dim:
-                    edges.append((r * dim + col - 1, EAST))
-                    edges.append((r * dim + col, WEST))
-        return edges
-
-    @classmethod
-    def get(cls, dim: int) -> "_Geometry":
-        geometry = cls._cache.get(dim)
-        if geometry is None:
-            geometry = cls(dim)
-            cls._cache[dim] = geometry
-        return geometry
-
 
 class _Zobrist:
     """Incremental hash keys, so a node's key costs a few XORs instead of hashing every wall."""
-
-    _cache: dict[int, "_Zobrist"] = {}
 
     def __init__(self, dim: int) -> None:
         rng = random.Random(0x5EED)
@@ -211,13 +166,11 @@ class _Zobrist:
                 self.wall_mirror[h_code] = h_keys[row][(dim - 2 - col) % dim]
                 self.wall_mirror[v_code] = v_keys[row][dim - col]
 
-    @classmethod
-    def get(cls, dim: int) -> "_Zobrist":
-        table = cls._cache.get(dim)
-        if table is None:
-            table = cls(dim)
-            cls._cache[dim] = table
-        return table
+
+@lru_cache(maxsize=None)
+def _tables(dim: int) -> tuple[_Geometry, _Zobrist]:
+    """Geometry and hash keys for a board size, built once and shared."""
+    return _Geometry(dim), _Zobrist(dim)
 
 
 class _Board:
@@ -228,8 +181,7 @@ class _Board:
 
     def __init__(self, state: GameStateQuoridor, my_id: int) -> None:
         dim = state.rep.dimension
-        self.geo = _Geometry.get(dim)
-        self.zobrist = _Zobrist.get(dim)
+        self.geo, self.zobrist = _tables(dim)
         self.dim = dim
         self.size = dim * dim
         self.blocked = [0] * self.size            # per cell: bitmask of closed directions
@@ -305,11 +257,9 @@ class _Board:
                 return False
         return True
 
-    def wall_legal(self, code: int, placer: int | None = None) -> bool:
+    def wall_legal(self, code: int) -> bool:
         """Full legality, mirroring GameStateQuoridor._is_wall_legal exactly."""
-        if self.walls_left[self.turn if placer is None else placer] <= 0:
-            return False
-        if not self.wall_fits(code):
+        if self.walls_left[self.turn] <= 0 or not self.wall_fits(code):
             return False
         self.place(code)
         ok = self.has_path(0) and self.has_path(1)
@@ -370,11 +320,7 @@ class _Board:
         other = self.pawns[1 - player]
         for direction in range(4):
             self._try_direction(self.pawns[player], direction, other, destinations)
-        unique = []
-        for cell in destinations:
-            if cell not in unique:
-                unique.append(cell)
-        return unique
+        return list(dict.fromkeys(destinations))  # a jump can reach the same square twice
 
     def _try_direction(self, cell: int, direction: int, other: int, out: list[int]) -> None:
         nxt = self.geo.neighbours[cell][direction]
@@ -511,9 +457,8 @@ class _Board:
 class MyPlayer(PlayerQuoridor):
     """Quoridor agent: iterative-deepening principal-variation search on a fast mutable board."""
 
-    # Test switches used by tools/test_search.py (class attributes, not in the game JSON)
+    # Test switch used by tools/test_search.py (class attribute, not in the game JSON)
     _strict = False
-    _reductions = True
 
     def __init__(self, piece_type: str, goal_row: int = 0, name: str = "bob", *args, **kwargs) -> None:
         """Create the player (piece type, goal row, name)."""
@@ -607,10 +552,7 @@ class MyPlayer(PlayerQuoridor):
     def _search_root(self, board: _Board, moves: list[int], depth: int) -> tuple[int, int]:
         """One deepening pass over the root moves; the repetition penalty is applied only here."""
         self._partial = None
-        path_me = board.shortest_path(0)
-        path_op = board.shortest_path(1)
-        info = (len(path_me) - 1, len(path_op) - 1, path_me,
-                board.crossings(path_me), board.crossings(path_op))
+        crossings = (board.crossings(board.shortest_path(0)), board.crossings(board.shortest_path(1)))
 
         best_move = moves[0]
         best_adjusted = -INFINITY
@@ -618,12 +560,12 @@ class MyPlayer(PlayerQuoridor):
         for index, move in enumerate(moves):
             cost = self._repetition_cost(board, move)
             if index == 0:
-                value = self._search_child(board, move, depth, -INFINITY, INFINITY, info, 0)
+                value = self._search_child(board, move, depth, -INFINITY, INFINITY, crossings, 0)
             else:
                 threshold = best_adjusted + cost
-                value = self._search_child(board, move, depth, threshold, threshold + 1, info, 0)
+                value = self._search_child(board, move, depth, threshold, threshold + 1, crossings, 0)
                 if value is not None and value > threshold:
-                    value = self._search_child(board, move, depth, threshold, INFINITY, info, 0)
+                    value = self._search_child(board, move, depth, threshold, INFINITY, crossings, 0)
             if value is None:
                 continue
             if value - cost > best_adjusted:
@@ -635,46 +577,28 @@ class MyPlayer(PlayerQuoridor):
         return best_move, best_value
 
     def _search_child(self, board: _Board, move: int, depth: int, alpha: int, beta: int,
-                      info: tuple, ply: int) -> int | None:
+                      crossings: tuple, ply: int) -> int | None:
         """Play `move`, search below it, undo it; None means the move was an illegal wall."""
-        d_me, d_op, path_me, cross_me, cross_op = info
-        mover = board.turn
-
         if move < board.size:
             previous = board.make_move(move)
-            if depth == 1:
-                # The child is a leaf: only the mover's distance changed, by -1 along its shortest path
-                if len(path_me) > 1 and move == path_me[1]:
-                    d_me -= 1
-                else:
-                    d_me = board.distance(mover)
-            value = -self._negamax(board, depth - 1, -beta, -alpha, d_op, d_me, ply + 1)
+            value = -self._negamax(board, depth - 1, -beta, -alpha, ply + 1)
             board.unmake_move(previous)
             return value
 
+        # A wall is legal if both players keep a path; only a shortest path it cuts needs a check
         cuts = board.geo.wall_cuts[move]
-        cuts_op = not cuts.isdisjoint(cross_op)
-        cuts_me = not cuts.isdisjoint(cross_me)
+        mover = board.turn
+        cross_me, cross_op = crossings
         board.make_wall(move)
-        # Only a player whose shortest path is cut needs a new path search (also settles legality)
-        if depth == 1:
-            if cuts_op:
-                d_op = board.distance(1 - mover)
-            if cuts_me and d_op is not None:
-                d_me = board.distance(mover)
-            legal = d_op is not None and d_me is not None
-        else:
-            legal = ((not cuts_op or board.has_path(1 - mover))
-                     and (not cuts_me or board.has_path(mover)))
         value = None
-        if legal:
-            value = -self._negamax(board, depth - 1, -beta, -alpha, d_op, d_me, ply + 1)
+        if ((cuts.isdisjoint(cross_op) or board.has_path(1 - mover))
+                and (cuts.isdisjoint(cross_me) or board.has_path(mover))):
+            value = -self._negamax(board, depth - 1, -beta, -alpha, ply + 1)
         board.unmake_wall(move)
         return value
 
-    def _negamax(self, board: _Board, depth: int, alpha: int, beta: int,
-                 d_me: int, d_op: int, ply: int) -> int:
-        """Negamax value for the side to move; d_me and d_op are only read at depth 0."""
+    def _negamax(self, board: _Board, depth: int, alpha: int, beta: int, ply: int) -> int:
+        """Negamax value of the position for the side to move."""
         self._nodes += 1
         if self._nodes >= self._next_clock_check:
             self._next_clock_check = self._nodes + CLOCK_CHECK_INTERVAL
@@ -687,9 +611,9 @@ class MyPlayer(PlayerQuoridor):
         # Only the player who has just moved can be standing on its goal row.
         if geo.row_of[board.pawns[other]] == board.goals[other]:
             return -(WIN_SCORE + depth)
+        walls_term = W_WALLS * (board.walls_left[turn] - board.walls_left[other])
         if depth <= 0:
-            return (W_DISTANCE * (d_op - d_me)
-                    + W_WALLS * (board.walls_left[turn] - board.walls_left[other]) + TEMPO)
+            return W_DISTANCE * (board.distance(other) - board.distance(turn)) + walls_term + TEMPO
 
         # Transposition table
         strict = self._strict
@@ -715,27 +639,26 @@ class MyPlayer(PlayerQuoridor):
         path_me = board.shortest_path(turn)
         path_op = board.shortest_path(other)
         d_me, d_op = len(path_me) - 1, len(path_op) - 1
-        cross_me, cross_op = board.crossings(path_me), board.crossings(path_op)
-        info = (d_me, d_op, path_me, cross_me, cross_op)
-
-        ordered = self._ordered_moves(board, depth, ply, tt_move, info, path_op)
+        cross_me, cross_op = crossings = (board.crossings(path_me), board.crossings(path_op))
+        ordered = self._ordered_moves(board, depth, ply, tt_move, path_me, path_op, crossings)
 
         alpha_start = alpha
         best_value = -INFINITY
         best_move = -1
         searched = 0
         size = board.size
-
-        if depth == 1:
-            # Frontier: children are leaves, scored here without playing the move
-            walls_term = W_WALLS * (board.walls_left[turn] - board.walls_left[other])
+        frontier = depth == 1  # children are leaves: scored in the loop without playing the move
+        if frontier:
             forward = path_me[1] if d_me > 0 else -1
             goal_row = board.goals[turn]
             row_of = geo.row_of
             wall_cuts = geo.wall_cuts
             pawns = board.pawns
             here = pawns[turn]
-            for move in ordered:
+        reduce_from = LMR_FULL_MOVES if depth >= LMR_MIN_DEPTH else 1 << 30
+
+        for move in ordered:
+            if frontier:
                 if move < size:
                     if row_of[move] == goal_row:
                         value = WIN_SCORE
@@ -763,46 +686,32 @@ class MyPlayer(PlayerQuoridor):
                             continue  # illegal wall
                     value = W_DISTANCE * (after_op - after_me) + walls_term - W_WALLS - TEMPO
                 self._nodes += 1
-                searched += 1
-                if value > best_value:
-                    best_value = value
-                    best_move = move
-                    if value > alpha:
-                        alpha = value
-                        if alpha >= beta:
-                            self._record_cutoff(move, depth, ply)
-                            break
-        else:
-            # Principal-variation search
-            reduce_from = LMR_FULL_MOVES if (self._reductions and depth >= LMR_MIN_DEPTH) else 1 << 30
-            for move in ordered:
-                if searched == 0:
-                    value = self._search_child(board, move, depth, alpha, beta, info, ply)
-                else:
-                    # Null window for later moves, late walls one ply less; re-search on success
-                    reduced = searched >= reduce_from and move >= size
-                    value = self._search_child(board, move, depth - 1 if reduced else depth,
-                                               alpha, alpha + 1, info, ply)
-                    if value is not None and value > alpha and reduced:
-                        value = self._search_child(board, move, depth, alpha, alpha + 1, info, ply)
-                    if value is not None and alpha < value < beta:
-                        value = self._search_child(board, move, depth, alpha, beta, info, ply)
-                if value is None:
-                    continue  # illegal wall
-                searched += 1
-                if value > best_value:
-                    best_value = value
-                    best_move = move
-                    if value > alpha:
-                        alpha = value
-                        if alpha >= beta:
-                            self._record_cutoff(move, depth, ply)
-                            break
+            elif searched == 0:
+                value = self._search_child(board, move, depth, alpha, beta, crossings, ply)
+            else:
+                # Null window for later moves, late walls one ply less; re-search on success
+                reduced = searched >= reduce_from and move >= size
+                value = self._search_child(board, move, depth - 1 if reduced else depth,
+                                           alpha, alpha + 1, crossings, ply)
+                if value is not None and value > alpha and reduced:
+                    value = self._search_child(board, move, depth, alpha, alpha + 1, crossings, ply)
+                if value is not None and alpha < value < beta:
+                    value = self._search_child(board, move, depth, alpha, beta, crossings, ply)
+            if value is None:
+                continue  # illegal wall
+            searched += 1
+            if value > best_value:
+                best_value = value
+                best_move = move
+                if value > alpha:
+                    alpha = value
+                    if alpha >= beta:
+                        self._record_cutoff(move, depth, ply)
+                        break
 
         if searched == 0:
             # No legal action (pawn boxed in by the other pawn): static score
-            return (W_DISTANCE * (d_op - d_me)
-                    + W_WALLS * (board.walls_left[turn] - board.walls_left[other]) + TEMPO)
+            return W_DISTANCE * (d_op - d_me) + walls_term + TEMPO
 
         # <= old alpha: upper bound, >= beta: lower bound, otherwise exact
         if best_value <= alpha_start:
@@ -851,9 +760,10 @@ class MyPlayer(PlayerQuoridor):
         return walls
 
     def _ordered_moves(self, board: _Board, depth: int, ply: int, tt_move: int,
-                       info: tuple, path_op: list[int]) -> list[int]:
+                       path_me: list[int], path_op: list[int], crossings: tuple) -> list[int]:
         """Moves to try, best first: table move, forward step, walls, then other pawn moves."""
-        d_me, d_op, path_me, cross_me, cross_op = info
+        d_me, d_op = len(path_me) - 1, len(path_op) - 1
+        cross_me, cross_op = crossings
         turn = board.turn
         pawn_moves = board.pawn_destinations(turn)
         walls = self._wall_candidates(board, path_me, path_op)
@@ -930,18 +840,12 @@ class MyPlayer(PlayerQuoridor):
 
     def _fallback_move(self, board: _Board, moves: list[int]) -> int:
         """Pawn move that gets closest to the goal, used when there is no time to search."""
-        best_move = moves[0]
-        best_distance = INFINITY
-        for move in moves:
-            if move >= board.size:
-                continue
+        def distance_after(move: int) -> int:
             previous = board.make_move(move)
             distance = board.distance(0)
             board.unmake_move(previous)
-            if distance is not None and distance < best_distance:
-                best_distance = distance
-                best_move = move
-        return best_move
+            return distance
+        return min((m for m in moves if m < board.size), key=distance_after, default=moves[0])
 
     # Conversion to engine actions
 
