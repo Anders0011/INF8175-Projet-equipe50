@@ -1,0 +1,2 @@
+T40      vs V5       clock 90s: 25/60 =  41.7%  (+-13)  time used 4754s vs 2019s, mean depth 2.1 vs 2.0, losses on time 36  [33914s]
+V6       vs V5       clock 90s: 36/60 =  60.0%  (+-12)  time used 1433s vs 1413s, mean depth 4.7 vs 4.8, losses on time 12  [14247s]

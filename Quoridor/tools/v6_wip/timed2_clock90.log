@@ -1,0 +1,3 @@
+T40      vs V5       clock 90s: 36/60 =  60.0%  (+-13)  time used 67s vs 46s, mean depth 7.1 vs 6.9, losses on time 0, suspect games 0 (worst overrun 0.11s)  [899s]
+V6       vs V5       clock 90s: 39/60 =  65.0%  (+-13)  time used 63s vs 44s, mean depth 6.8 vs 6.9, losses on time 0, suspect games 0 (worst overrun 0.08s)  [844s]
+F170     vs V5       clock 90s: 27/60 =  45.0%  (+-11)  time used 43s vs 43s, mean depth 6.5 vs 6.8, losses on time 0, suspect games 0 (worst overrun 0.14s)  [706s]
