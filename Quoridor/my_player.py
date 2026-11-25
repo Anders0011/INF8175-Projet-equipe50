@@ -22,7 +22,7 @@ class _TimeUp(Exception):
 
 # Evaluation weights (integers, in hundredths of a pawn step)
 W_DISTANCE = 100           # one step of shortest-path lead
-W_WALLS = 124              # one wall in hand, about 1.24 steps (fitted on game outcomes)
+W_WALLS = 124              # one wall in hand is worth about 1.24 steps
 TEMPO = 50                 # bonus for the side to move, keeps leaves at different depths comparable
 WIN_SCORE = 10_000_000
 INFINITY = 1_000_000_000
@@ -457,7 +457,10 @@ class _Board:
 class MyPlayer(PlayerQuoridor):
     """Quoridor agent: iterative-deepening principal-variation search on a fast mutable board."""
 
-    # Test switch used by tools/test_search.py (class attribute, not in the game JSON)
+    # Debugging switch, always False in a game: when True, table values are reused only at the
+    # same depth and mirror keys are off; with late-move reductions also disabled
+    # (LMR_MIN_DEPTH set very high), the search then returns the exact minimax value
+    # (class attribute, not in the game JSON)
     _strict = False
 
     def __init__(self, piece_type: str, goal_row: int = 0, name: str = "bob", *args, **kwargs) -> None:
